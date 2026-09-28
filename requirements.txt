@@ -4,6 +4,7 @@ fastapi==0.141.1
 starlette==1.6.0
 uvicorn[standard]==0.25.0
 httpx==0.28.1
+phonenumbers>=8.13,<10
 python-dotenv==1.2.2
 google-cloud-firestore==2.19.0
 numpy>=1.26,<3

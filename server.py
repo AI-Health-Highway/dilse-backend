@@ -11,19 +11,22 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
 import secrets
 import socket
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+import phonenumbers
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from google.cloud import firestore
 from google.cloud.firestore_v1 import FieldFilter
 from starlette.middleware.cors import CORSMiddleware
@@ -31,6 +34,7 @@ from starlette.middleware.cors import CORSMiddleware
 from risk import qrisk3, score2, who_ish, route_and_run, list_models
 from echo_centers import find_centers, list_cities, BRAND_META, list_partners
 import wearables
+from services.engagelo import EngageloClient, EngageloConfigurationError, EngageloDeliveryError, EngageloSettings, mask_phone
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -45,6 +49,27 @@ CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 # the `patients` collection, logs, and stats require this admin key.
 # Unset → those endpoints are open too (local dev). Set via deploy.sh.
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+WHATSAPP_SETTINGS = EngageloSettings.from_env()
+APP_ENV = os.environ.get("APP_ENV", "production" if os.environ.get("K_SERVICE") else "development").strip().lower()
+WHATSAPP_DEV_OTP = os.environ.get("WHATSAPP_DEV_OTP", "555666" if APP_ENV == "development" else "").strip()
+if WHATSAPP_DEV_OTP and not (len(WHATSAPP_DEV_OTP) == 6 and WHATSAPP_DEV_OTP.isdigit()):
+    raise EngageloConfigurationError("WHATSAPP_DEV_OTP must be exactly 6 digits")
+if WHATSAPP_DEV_OTP and APP_ENV in {"production", "prod"}:
+    raise EngageloConfigurationError("WHATSAPP_DEV_OTP is forbidden in production")
+WHATSAPP_AUTH_ENABLED = WHATSAPP_SETTINGS.enabled or bool(WHATSAPP_DEV_OTP)
+OTP_TTL_SECONDS = max(60, int(os.environ.get("OTP_TTL_SECONDS", "300")))
+OTP_MAX_ATTEMPTS = max(1, int(os.environ.get("OTP_MAX_ATTEMPTS", "5")))
+OTP_RESEND_COOLDOWN_SECONDS = max(1, int(os.environ.get("OTP_RESEND_COOLDOWN_SECONDS", "30")))
+OTP_HASH_SECRET = os.environ.get("OTP_HASH_SECRET", "") or ("dilsay-local-development-only" if WHATSAPP_DEV_OTP else "")
+AUTH_SESSION_TTL_SECONDS = max(3600, int(os.environ.get("AUTH_SESSION_TTL_SECONDS", str(30 * 86400))))
+AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "true").strip().lower() in {"1", "true", "yes", "on"}
+ENGAGELO_WEBHOOK_SECRET = os.environ.get("ENGAGELO_WEBHOOK_SECRET", "")
+PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "").rstrip("/")
+CONSENT_VERSION = os.environ.get("WHATSAPP_CONSENT_VERSION", "2026-09-01")
+if WHATSAPP_AUTH_ENABLED and not OTP_HASH_SECRET:
+    raise EngageloConfigurationError("Missing required WhatsApp configuration: OTP_HASH_SECRET")
+if WHATSAPP_SETTINGS.enabled and not ENGAGELO_WEBHOOK_SECRET:
+    raise EngageloConfigurationError("Missing required WhatsApp configuration: ENGAGELO_WEBHOOK_SECRET")
 
 _db: Optional[firestore.AsyncClient] = None
 
@@ -67,6 +92,12 @@ COL_HEALTH_REPORTS = "health_reports"
 COL_WEARABLE_READINGS = "wearable_readings"
 COL_WEARABLE_WAITLIST = "wearable_waitlist"
 COL_WEARABLE_TOKENS = "wearable_tokens"
+COL_OTP_CHALLENGES = "otp_challenges"
+COL_AUTH_SESSIONS = "auth_sessions"
+COL_WHATSAPP_CONSENTS = "whatsapp_consents"
+COL_WHATSAPP_DELIVERIES = "whatsapp_deliveries"
+COL_WHATSAPP_WEBHOOK_EVENTS = "whatsapp_webhook_events"
+COL_TEST_UPDATES = "test_updates"
 
 
 # ── Firestore helpers ─────────────────────────────────────
@@ -160,6 +191,147 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_phone(raw: str) -> str:
+    """Normalize to E.164, defaulting national numbers to configured India code."""
+    value = (raw or "").strip()
+    if not value:
+        raise ValueError("phone is required")
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if not value.startswith("+"):
+        country = WHATSAPP_SETTINGS.default_country_code or "91"
+        if digits.startswith(country) and len(digits) > 10:
+            value = "+" + digits
+        else:
+            value = "+" + country + digits
+    try:
+        parsed = phonenumbers.parse(value, None)
+    except phonenumbers.NumberParseException as exc:
+        raise ValueError("invalid phone") from exc
+    if not phonenumbers.is_valid_number(parsed):
+        raise ValueError("invalid phone")
+    return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+
+
+def _secret_hash(*parts: str) -> str:
+    secret = OTP_HASH_SECRET.encode("utf-8")
+    return hmac.new(secret, ":".join(parts).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _iso_from_epoch(value: float) -> str:
+    return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+
+def _session_token(request: Request) -> str:
+    token = getattr(request, "cookies", {}).get("dilsay_session", "")
+    if token:
+        return token
+    authorization = getattr(request, "headers", {}).get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+async def _session_patient(request: Request, *, required: bool = False) -> Optional[Dict[str, Any]]:
+    token = _session_token(request)
+    if not token:
+        if required:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        return None
+    session = await fs_get(COL_AUTH_SESSIONS, _token_hash(token))
+    if not session or session.get("revoked_at") or float(session.get("expires_at_epoch") or 0) <= time.time():
+        if required:
+            raise HTTPException(status_code=401, detail="Session expired")
+        return None
+    patient = await fs_get(COL_PATIENTS, session.get("patient_id") or "")
+    if not patient:
+        if required:
+            raise HTTPException(status_code=401, detail="Session is no longer valid")
+        return None
+    return patient
+
+
+async def _create_or_get_patient(phone: str, body: Optional[Dict[str, Any]] = None, *, verified: bool = False) -> tuple[Dict[str, Any], bool]:
+    body = body or {}
+    matches = await fs_list(COL_PATIENTS, where={"phone": phone}, limit=1, order_by=None)
+    existing = matches[0] if matches else None
+    if existing:
+        patch = {key: body[key] for key in ("sex", "ethnicity", "dob", "notes") if body.get(key) and not existing.get(key)}
+        if verified and not existing.get("phone_verified_at"):
+            patch["phone_verified_at"] = now_iso()
+        if patch:
+            existing.update(patch)
+            existing["updated_at"] = now_iso()
+            await fs_put(COL_PATIENTS, existing)
+        return existing, True
+    code = _make_patient_code()
+    record = {
+        "id": str(uuid.uuid4()),
+        "code": code,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "phone": phone,
+        "phone_verified_at": now_iso() if verified else None,
+        "sex": (body.get("sex") or "").strip() or None,
+        "ethnicity": (body.get("ethnicity") or "").strip() or None,
+        "dob": body.get("dob"),
+        "notes": body.get("notes"),
+        "color": body.get("color") or _pick_color(code),
+        "whatsapp_health_updates_consent": False,
+        "whatsapp_consent_version": None,
+        "whatsapp_consented_at": None,
+        "whatsapp_revoked_at": None,
+    }
+    await fs_put(COL_PATIENTS, record)
+    logger.info("patient_created id=%s phone=%s", record["id"][:8], mask_phone(phone))
+    return record, False
+
+
+async def _deliver_whatsapp_event(patient_id: str, message_type: str, subject_id: Optional[str] = None, report_url: Optional[str] = None) -> None:
+    """Best-effort background delivery. Never raises into a scan/report request."""
+    patient = await fs_get(COL_PATIENTS, patient_id)
+    if not patient or not patient.get("whatsapp_health_updates_consent"):
+        return
+    delivery = {
+        "id": str(uuid.uuid4()),
+        "patient_id": patient_id,
+        "message_type": message_type,
+        "subject_id": subject_id,
+        "status": "queued",
+        "provider_message_id": None,
+        "error_code": None,
+        "error_message": None,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await fs_put(COL_WHATSAPP_DELIVERIES, delivery)
+    try:
+        client = EngageloClient(WHATSAPP_SETTINGS)
+        if message_type == "scan_complete":
+            result = await client.send_scan_complete(patient["phone"])
+        elif message_type == "report_ready":
+            result = await client.send_report_ready(patient["phone"], report_url)
+        elif message_type == "test_update":
+            result = await client.send_test_update(patient["phone"])
+        else:
+            raise EngageloDeliveryError("Unsupported message type", safe_code="unsupported_message_type")
+        delivery.update({
+            "status": "sent" if result.get("sent") else "failed",
+            "provider_message_id": result.get("provider_message_id"),
+            "error_code": "integration_disabled" if result.get("disabled") else None,
+            "updated_at": now_iso(),
+        })
+    except EngageloDeliveryError as exc:
+        delivery.update({"status": "failed", "error_code": exc.safe_code, "error_message": str(exc)[:160], "updated_at": now_iso()})
+    except Exception:
+        logger.exception("whatsapp_delivery_unexpected type=%s patient=%s", message_type, patient_id[:8])
+        delivery.update({"status": "failed", "error_code": "internal_error", "error_message": "Unexpected delivery error", "updated_at": now_iso()})
+    await fs_put(COL_WHATSAPP_DELIVERIES, delivery)
+
+
 def _clean(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if doc is None:
         return None
@@ -183,6 +355,7 @@ def _strip_snapshot(d: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": d.get("created_at"),
         "assessmentId": d.get("assessmentId"),
         "patientId": d.get("patientId"),
+        "mode": d.get("mode"),
         "fused": d.get("fused"),
         "face": shrink(d.get("face")),
         "finger": shrink(d.get("finger")),
@@ -220,7 +393,11 @@ async def local_ip() -> Dict[str, Any]:
 @api.get("/config")
 async def config() -> Dict[str, Any]:
     # Never return the key itself — only whether AI features are available.
-    return {"aiEnabled": bool(MISTRAL_KEY)}
+    return {
+        "aiEnabled": bool(MISTRAL_KEY),
+        "whatsappEnabled": WHATSAPP_AUTH_ENABLED,
+        "whatsappDevelopmentMode": bool(WHATSAPP_DEV_OTP),
+    }
 
 
 # ── Assessments ───────────────────────────────────────────
@@ -275,15 +452,18 @@ async def get_assessment(aid: str) -> Dict[str, Any]:
 # ── Snapshots ─────────────────────────────────────────────
 
 @api.post("/snapshot")
-async def save_snapshot(request: Request) -> Dict[str, Any]:
+async def save_snapshot(request: Request, background_tasks: BackgroundTasks = None) -> Dict[str, Any]:
     body = await request.json()
     if not body.get("fused"):
         raise HTTPException(status_code=400, detail="Missing fused result")
+    session_patient = await _session_patient(request)
+    patient_id = session_patient.get("id") if session_patient else body.get("patientId")
     record = {
         "id": str(uuid.uuid4()),
         "created_at": now_iso(),
         "assessmentId": body.get("assessmentId"),
-        "patientId": body.get("patientId"),
+        "patientId": patient_id,
+        "mode": body.get("mode") or ("finger" if body.get("finger") else "face" if body.get("face") else "unknown"),
         "fused": body.get("fused"),
         "face": body.get("face"),
         "finger": body.get("finger"),
@@ -295,6 +475,8 @@ async def save_snapshot(request: Request) -> Dict[str, Any]:
         record["id"][:8], record.get("patientId"),
         fused.get("bpm"), fused.get("quality"),
     )
+    if session_patient and background_tasks is not None:
+        background_tasks.add_task(_deliver_whatsapp_event, session_patient["id"], "scan_complete", record["id"])
     return {"ok": True, "id": record["id"]}
 
 
@@ -388,14 +570,160 @@ async def stats(request: Request) -> Dict[str, Any]:
     }
 
 
-# ── Patients (multi-patient mode) ─────────────────────────
+# ── WhatsApp OTP authentication ───────────────────────────
 
-def _normalize_phone(raw: str) -> str:
-    """Keep digits (and a leading +). Enough to dedupe on."""
-    raw = (raw or "").strip()
-    plus = raw.startswith("+")
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    return ("+" + digits) if plus else digits
+@api.post("/auth/whatsapp/request-otp")
+async def request_whatsapp_otp(request: Request) -> Dict[str, Any]:
+    if not WHATSAPP_AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail={"code": "WHATSAPP_DISABLED", "message": "WhatsApp verification is not enabled"})
+    body = await request.json()
+    try:
+        phone = _normalize_phone(body.get("phone") or "")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Enter a valid mobile number")
+    challenge_id = hashlib.sha256(phone.encode("utf-8")).hexdigest()
+    existing = await fs_get(COL_OTP_CHALLENGES, challenge_id)
+    current_time = time.time()
+    if existing and current_time - float(existing.get("sent_at_epoch") or 0) < OTP_RESEND_COOLDOWN_SECONDS:
+        retry_after = max(1, OTP_RESEND_COOLDOWN_SECONDS - int(current_time - float(existing.get("sent_at_epoch") or 0)))
+        raise HTTPException(status_code=429, detail={"code": "OTP_COOLDOWN", "message": "Please wait before requesting another code", "retry_after": retry_after})
+    otp = WHATSAPP_DEV_OTP or f"{secrets.randbelow(1_000_000):06d}"
+    challenge = {
+        "id": challenge_id,
+        "phone": phone,
+        "otp_hash": _secret_hash(phone, otp),
+        "attempts": 0,
+        "max_attempts": OTP_MAX_ATTEMPTS,
+        "sent_at_epoch": current_time,
+        "expires_at_epoch": current_time + OTP_TTL_SECONDS,
+        "used_at": None,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await fs_put(COL_OTP_CHALLENGES, challenge)
+    if WHATSAPP_DEV_OTP:
+        logger.warning("development_otp_enabled phone=%s; no WhatsApp message sent", mask_phone(phone))
+    else:
+        try:
+            await EngageloClient(WHATSAPP_SETTINGS).send_otp(phone, otp, max(1, OTP_TTL_SECONDS // 60))
+        except EngageloDeliveryError as exc:
+            challenge.update({"delivery_error": exc.safe_code, "updated_at": now_iso()})
+            await fs_put(COL_OTP_CHALLENGES, challenge)
+            raise HTTPException(status_code=503, detail="Unable to send OTP. Please try again.")
+    logger.info("otp_requested phone=%s", mask_phone(phone))
+    return {"success": True, "message": "OTP sent", "expiresIn": OTP_TTL_SECONDS, "resendAfter": OTP_RESEND_COOLDOWN_SECONDS}
+
+
+@api.post("/auth/whatsapp/verify-otp")
+async def verify_whatsapp_otp(request: Request, response: Response) -> Dict[str, Any]:
+    if not WHATSAPP_AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="WhatsApp verification is not enabled")
+    body = await request.json()
+    otp = str(body.get("otp") or "").strip()
+    try:
+        phone = _normalize_phone(body.get("phone") or "")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Incorrect or expired OTP.")
+    challenge_id = hashlib.sha256(phone.encode("utf-8")).hexdigest()
+    challenge = await fs_get(COL_OTP_CHALLENGES, challenge_id)
+    current_time = time.time()
+    if not challenge or challenge.get("used_at") or float(challenge.get("expires_at_epoch") or 0) <= current_time:
+        raise HTTPException(status_code=400, detail="Incorrect or expired OTP.")
+    attempts = int(challenge.get("attempts") or 0)
+    if attempts >= OTP_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new OTP.")
+    if not (len(otp) == 6 and otp.isdigit() and hmac.compare_digest(challenge.get("otp_hash") or "", _secret_hash(phone, otp))):
+        challenge["attempts"] = attempts + 1
+        challenge["updated_at"] = now_iso()
+        await fs_put(COL_OTP_CHALLENGES, challenge)
+        if challenge["attempts"] >= OTP_MAX_ATTEMPTS:
+            raise HTTPException(status_code=429, detail="Too many attempts. Request a new OTP.")
+        raise HTTPException(status_code=400, detail="Incorrect or expired OTP.")
+    challenge.update({"used_at": now_iso(), "otp_hash": None, "updated_at": now_iso()})
+    await fs_put(COL_OTP_CHALLENGES, challenge)
+    patient, existing_patient = await _create_or_get_patient(phone, verified=True)
+    raw_token = secrets.token_urlsafe(32)
+    session_id = _token_hash(raw_token)
+    session = {
+        "id": session_id,
+        "patient_id": patient["id"],
+        "created_at": now_iso(),
+        "expires_at": _iso_from_epoch(current_time + AUTH_SESSION_TTL_SECONDS),
+        "expires_at_epoch": current_time + AUTH_SESSION_TTL_SECONDS,
+        "revoked_at": None,
+    }
+    await fs_put(COL_AUTH_SESSIONS, session)
+    response.set_cookie("dilsay_session", raw_token, max_age=AUTH_SESSION_TTL_SECONDS, httponly=True, secure=AUTH_COOKIE_SECURE, samesite="lax", path="/")
+    logger.info("otp_verified patient=%s phone=%s", patient["id"][:8], mask_phone(phone))
+    return {"success": True, "row": patient, "existing": existing_patient, "sessionExpiresAt": session["expires_at"]}
+
+
+@api.get("/auth/session")
+async def auth_session(request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
+    return {"authenticated": True, "row": patient}
+
+
+@api.post("/auth/logout")
+async def auth_logout(request: Request, response: Response) -> Dict[str, Any]:
+    token = _session_token(request)
+    if token:
+        session = await fs_get(COL_AUTH_SESSIONS, _token_hash(token))
+        if session:
+            session["revoked_at"] = now_iso()
+            await fs_put(COL_AUTH_SESSIONS, session)
+    response.delete_cookie("dilsay_session", path="/")
+    return {"success": True}
+
+
+# ── WhatsApp health-update consent ────────────────────────
+
+@api.get("/whatsapp/consent")
+async def get_whatsapp_consent(request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
+    return {
+        "consent": bool(patient.get("whatsapp_health_updates_consent")),
+        "version": patient.get("whatsapp_consent_version"),
+        "consentedAt": patient.get("whatsapp_consented_at"),
+        "revokedAt": patient.get("whatsapp_revoked_at"),
+        "phone": patient.get("phone"),
+        "phoneVerified": bool(patient.get("phone_verified_at")),
+    }
+
+
+@api.put("/whatsapp/consent")
+async def update_whatsapp_consent(request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
+    body = await request.json()
+    if not isinstance(body.get("consent"), bool):
+        raise HTTPException(status_code=400, detail="consent must be true or false")
+    consented = bool(body["consent"])
+    source = str(body.get("source") or "profile")[:40]
+    timestamp = now_iso()
+    patient.update({
+        "whatsapp_health_updates_consent": consented,
+        "whatsapp_consent_version": CONSENT_VERSION,
+        "whatsapp_consented_at": timestamp if consented else patient.get("whatsapp_consented_at"),
+        "whatsapp_revoked_at": None if consented else timestamp,
+        "whatsapp_consent_source": source,
+        "updated_at": timestamp,
+    })
+    await fs_put(COL_PATIENTS, patient)
+    audit = {
+        "id": str(uuid.uuid4()),
+        "patient_id": patient["id"],
+        "phone": patient.get("phone"),
+        "consent": consented,
+        "consent_version": CONSENT_VERSION,
+        "source": source,
+        "created_at": timestamp,
+    }
+    await fs_put(COL_WHATSAPP_CONSENTS, audit)
+    logger.info("whatsapp_consent patient=%s granted=%s source=%s", patient["id"][:8], consented, source)
+    return {"success": True, "consent": consented, "version": CONSENT_VERSION, "updatedAt": timestamp}
+
+
+# ── Patients (multi-patient mode) ─────────────────────────
 
 
 @api.post("/patients")
@@ -407,8 +735,9 @@ async def create_patient(request: Request) -> Dict[str, Any]:
     phone always maps to the same patient record, so onboarding never duplicates.
     """
     body = await request.json()
-    phone = _normalize_phone(body.get("phone") or "")
-    if len(phone.lstrip("+")) < 7:
+    try:
+        phone = _normalize_phone(body.get("phone") or "")
+    except ValueError:
         raise HTTPException(status_code=400, detail="A valid phone number is required")
 
     # Reject obvious identifiers leaking in (privacy-by-design)
@@ -419,34 +748,8 @@ async def create_patient(request: Request) -> Dict[str, Any]:
             detail="AiSteth does not accept names or email addresses (GDPR/HIPAA data-minimisation).",
         )
 
-    # Idempotent lookup — return the existing patient for this phone if present.
-    # No order_by → single-field filter, so no composite index required.
-    _matches = await fs_list(COL_PATIENTS, where={"phone": phone}, limit=1, order_by=None)
-    existing = _matches[0] if _matches else None
-    if existing:
-        # Backfill optional fields if the caller now supplies them.
-        patch = {k: body[k] for k in ("sex", "ethnicity", "dob", "notes")
-                 if body.get(k) and not existing.get(k)}
-        if patch:
-            existing.update(patch)
-            await fs_put(COL_PATIENTS, existing)
-        return {"ok": True, "row": existing, "existing": True}
-
-    code = _make_patient_code()
-    record = {
-        "id": str(uuid.uuid4()),
-        "code": code,
-        "created_at": now_iso(),
-        "phone": phone,
-        "sex": (body.get("sex") or "").strip() or None,
-        "ethnicity": (body.get("ethnicity") or "").strip() or None,
-        "dob": body.get("dob"),
-        "notes": body.get("notes"),
-        "color": body.get("color") or _pick_color(code),
-    }
-    await fs_put(COL_PATIENTS, record)
-    logger.info("patient created id=%s code=%s", record["id"][:8], code)
-    return {"ok": True, "row": record, "existing": False}
+    record, existing = await _create_or_get_patient(phone, body)
+    return {"ok": True, "row": record, "existing": existing}
 
 
 def _make_patient_code() -> str:
@@ -549,6 +852,11 @@ async def forget_patient(pid: str, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Not found")
     n_snaps = await fs_delete_where(COL_SNAPSHOTS, "patientId", pid)
     n_assess = await fs_delete_where(COL_ASSESSMENTS, "patientId", pid)
+    n_reports = await fs_delete_where(COL_HEALTH_REPORTS, "patientId", pid)
+    n_consents = await fs_delete_where(COL_WHATSAPP_CONSENTS, "patient_id", pid)
+    n_deliveries = await fs_delete_where(COL_WHATSAPP_DELIVERIES, "patient_id", pid)
+    n_sessions = await fs_delete_where(COL_AUTH_SESSIONS, "patient_id", pid)
+    n_tests = await fs_delete_where(COL_TEST_UPDATES, "patient_id", pid)
     await get_db().collection(COL_PATIENTS).document(pid).delete()
     logger.info("patient erased pid=%s snaps=%s asses=%s", pid[:8], n_snaps, n_assess)
     return {
@@ -557,6 +865,11 @@ async def forget_patient(pid: str, request: Request) -> Dict[str, Any]:
             "patient": 1,
             "snapshots": n_snaps,
             "assessments": n_assess,
+            "healthReports": n_reports,
+            "whatsappConsents": n_consents,
+            "whatsappDeliveries": n_deliveries,
+            "authSessions": n_sessions,
+            "testUpdates": n_tests,
         },
     }
 
@@ -848,7 +1161,7 @@ def _fallback_health_analysis(risk_result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @api.post("/health/analyze")
-async def health_analyze(request: Request) -> Dict[str, Any]:
+async def health_analyze(request: Request, background_tasks: BackgroundTasks = None) -> Dict[str, Any]:
     """Generate a structured Mistral health analysis (single call).
 
     Body: { inputs: {...}, vitals?: {bpm,hrv_ms}, snapshotId?, patientId?, force? }
@@ -859,7 +1172,8 @@ async def health_analyze(request: Request) -> Dict[str, Any]:
     inputs = body.get("inputs") or {}
     vitals = body.get("vitals") or {}
     snapshot_id = body.get("snapshotId")
-    patient_id = body.get("patientId")
+    session_patient = await _session_patient(request)
+    patient_id = session_patient.get("id") if session_patient else body.get("patientId")
 
     # 1) Compute risk first (deterministic).
     risk_result = route_and_run(inputs)
@@ -963,6 +1277,9 @@ async def health_analyze(request: Request) -> Dict[str, Any]:
         "vitals": vitals,
     }
     await fs_put(COL_HEALTH_REPORTS, report)
+    if session_patient and background_tasks is not None:
+        report_url = f"{PUBLIC_APP_URL}/insights/report?id={report['id']}" if PUBLIC_APP_URL else None
+        background_tasks.add_task(_deliver_whatsapp_event, session_patient["id"], "report_ready", report["id"], report_url)
 
     return {
         "ok": True,
@@ -987,6 +1304,68 @@ async def get_health_report(rid: str) -> Dict[str, Any]:
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True, "row": doc}
+
+
+@api.post("/tests/status")
+async def save_test_status(request: Request, background_tasks: BackgroundTasks = None) -> Dict[str, Any]:
+    """Persist a generic AI-Steth/test status and optionally notify with consent."""
+    patient = await _session_patient(request, required=True)
+    body = await request.json()
+    status = str(body.get("status") or "").strip().lower()
+    if status not in {"received", "processing", "ready", "completed", "failed"}:
+        raise HTTPException(status_code=400, detail="Invalid test status")
+    record = {
+        "id": str(uuid.uuid4()),
+        "patient_id": patient["id"],
+        "test_type": str(body.get("testType") or "auscultation")[:40],
+        "status": status,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await fs_put(COL_TEST_UPDATES, record)
+    if status in {"ready", "completed"} and background_tasks is not None:
+        background_tasks.add_task(_deliver_whatsapp_event, patient["id"], "test_update", record["id"])
+    return {"ok": True, "id": record["id"], "status": status}
+
+
+@api.post("/webhooks/engagelo")
+async def engagelo_webhook(request: Request) -> Dict[str, Any]:
+    if not ENGAGELO_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Webhook is not configured")
+    raw = await request.body()
+    supplied = request.headers.get("x-engagelo-signature", "")
+    plain_secret = request.headers.get("x-webhook-secret", "")
+    expected = hmac.new(ENGAGELO_WEBHOOK_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    supplied_digest = supplied.removeprefix("sha256=")
+    signature_valid = bool(supplied_digest) and hmac.compare_digest(supplied_digest, expected)
+    secret_valid = bool(plain_secret) and hmac.compare_digest(plain_secret, ENGAGELO_WEBHOOK_SECRET)
+    if not (signature_valid or secret_valid):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid webhook payload")
+    provider_message_id = str(payload.get("wa_message_id") or payload.get("message_id") or payload.get("id") or "")
+    status = str(payload.get("message_status") or payload.get("status") or "").lower()
+    if not provider_message_id or status not in {"queued", "sent", "delivered", "read", "failed"}:
+        raise HTTPException(status_code=400, detail="Unsupported webhook event")
+    event_key = str(payload.get("event_id") or f"{provider_message_id}:{status}")
+    event_id = hashlib.sha256(event_key.encode("utf-8")).hexdigest()
+    if await fs_get(COL_WHATSAPP_WEBHOOK_EVENTS, event_id):
+        return {"ok": True, "duplicate": True}
+    event = {"id": event_id, "provider_message_id": provider_message_id, "status": status, "created_at": now_iso()}
+    await fs_put(COL_WHATSAPP_WEBHOOK_EVENTS, event)
+    deliveries = await fs_list(COL_WHATSAPP_DELIVERIES, where={"provider_message_id": provider_message_id}, limit=1, order_by=None)
+    if deliveries:
+        delivery = deliveries[0]
+        delivery.update({
+            "status": status,
+            "updated_at": now_iso(),
+            "error_code": str(payload.get("error_code") or "")[:80] or delivery.get("error_code"),
+            "error_message": str(payload.get("failed_reason") or "")[:160] or delivery.get("error_message"),
+        })
+        await fs_put(COL_WHATSAPP_DELIVERIES, delivery)
+    return {"ok": True, "duplicate": False}
 
 
 # ── Echo booking centers (India seed) ──────────────────────

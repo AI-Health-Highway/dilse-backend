@@ -436,13 +436,54 @@ Minimum manual smoke test:
 9. Exercise export/forget only against a disposable test patient using the admin header.
 10. Confirm logs contain identifiers/statuses but no phone numbers, health request bodies, or token material.
 
-## Deployment model
+## Deploy to Google Cloud Run
 
-The code is suitable for a containerized ASGI deployment such as Google Cloud Run:
+`Dockerfile` runs the FastAPI app on Cloud Run's `PORT`. `cloudbuild.yaml` creates
+the Artifact Registry repository if needed, builds and pushes an image, then
+deploys it to Cloud Run. The default service and repository are `dilse-backend`
+in `asia-south1`.
 
-```text
-uvicorn server:app --host 0.0.0.0 --port <PORT>
+One-time project setup:
+
+1. Create/select a GCP project with billing enabled and create its Firestore
+   `(default)` database in Native mode. Enable Cloud Build, Cloud Run,
+   Artifact Registry, Firestore, Resource Manager, and Secret Manager APIs:
+
+   ```powershell
+   gcloud services enable cloudbuild.googleapis.com run.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com cloudresourcemanager.googleapis.com secretmanager.googleapis.com --project=PROJECT_ID
+   ```
+2. Give the Cloud Build service account Artifact Registry Admin (repository
+   creation), Cloud Run Admin (deployment), and Service Account User on the
+   Cloud Run runtime service account. Find the build identity with
+   `gcloud builds get-default-service-account --project=PROJECT_ID`.
+3. Give the Cloud Run runtime service account Cloud Datastore User so the
+   backend can read and write Firestore. Cloud Run uses the Compute Engine
+   default service account unless you configure another runtime identity.
+4. Create a Secret Manager secret named `dilse-admin-key` with a strong random
+   value and grant the Cloud Run runtime service account Secret Manager Secret
+   Accessor on it. The build maps it to `ADMIN_KEY` at deployment. If you use
+   another secret name, pass `_ADMIN_SECRET` in the build substitutions. Keep
+   the secret value out of source files and build substitutions.
+
+From this `backend` directory, deploy with one command:
+
+```powershell
+gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml
 ```
+
+Override the defaults when needed:
+
+```powershell
+gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml --substitutions=_REGION=asia-south1,_REPOSITORY=dilse-backend,_SERVICE=dilse-backend,_ADMIN_SECRET=dilse-admin-key
+```
+
+The build updates `APP_ENV=production`, `GOOGLE_CLOUD_PROJECT`, and the
+`ADMIN_KEY` secret mapping without clearing other Cloud Run configuration. The
+API is deployed publicly (`--allow-unauthenticated`), matching the current
+public MVP design. Configure exact `CORS_ORIGINS` and any enabled provider
+secrets on the Cloud Run service. Set `PUBLIC_BASE_URL` for wearable OAuth and
+`PUBLIC_APP_URL` for WhatsApp links. Verify `/api/` and `/api/config` on the
+deployed service.
 
 Production deployment requirements:
 
@@ -603,3 +644,68 @@ Before transferring ownership, record or confirm:
 - The exact commit handed over and confirmation that both backend and frontend READMEs match it
 
 For code-level truth, use this order: active implementation, automated tests, this README, then historical notes. If they disagree, correct the code or documentation in the same change.
+
+## Engagelo and WhatsApp architecture
+
+The integration is feature-flagged with `WHATSAPP_INTEGRATION_ENABLED`. When false, the existing application works and no provider call is attempted. When true, startup validates sender, OTP-hash, and webhook configuration.
+
+For temporary local testing, `WHATSAPP_DEV_OTP` enables the OTP screen without contacting Engagelo. The configured six-digit value is hashed into the normal challenge record and verified through the same session flow. It is rejected at startup when `APP_ENV` is `production` or `prod`; remove it before testing real WhatsApp delivery.
+
+```text
+PWA (same-origin cookie)
+  -> FastAPI OTP/consent/scan endpoints
+     -> Firestore: OTP hashes, hashed sessions, consent audit, deliveries
+     -> services/engagelo.py: the only Engagelo HTTP boundary
+        -> Engagelo documented direct-send endpoint
+Engagelo delivery event
+  -> authenticated /api/webhooks/engagelo
+     -> idempotent delivery-state update
+```
+
+- Authentication consent and health-message consent are separate. Verifying a number never opts the patient into health updates.
+- OTPs use `secrets`, are HMAC-hashed at rest, expire, have a resend cooldown and attempt limit, and become unusable after successful verification.
+- Session tokens are random, stored only as SHA-256 hashes, returned only in an HttpOnly SameSite cookie, and revoked on logout.
+- Scan/report/test transactions complete independently of Engagelo. Delivery is a best-effort background task and records `queued`, `sent`, `delivered`, `read`, or `failed`.
+- `services/engagelo.py` owns provider request shape, timeouts, retries, phone masking, and sanitized errors. Keep provider calls out of route handlers.
+
+### Firestore collections
+
+| Collection | Purpose |
+|---|---|
+| `otp_challenges` | One challenge per normalized phone hash: HMAC OTP hash, expiry, attempts, cooldown, used timestamp |
+| `auth_sessions` | SHA-256 token ID, patient ID, expiry, revocation timestamp |
+| `patients` | Verified phone and current health-update preference/version/timestamps |
+| `whatsapp_consents` | Append-only grant/revoke evidence with version, source, and time |
+| `whatsapp_deliveries` | Message type, subject, provider ID, status, and sanitized error |
+| `whatsapp_webhook_events` | Idempotency records for authenticated provider events |
+| `test_updates` | Generic AI-Steth/test lifecycle events |
+
+### API contracts
+
+| Method and path | Authentication | Behavior |
+|---|---|---|
+| `POST /api/auth/whatsapp/request-otp` | Public + cooldown | Accepts `{phone}` and sends an OTP without exposing patient existence |
+| `POST /api/auth/whatsapp/verify-otp` | OTP | Accepts `{phone, otp}`, verifies/reuses the patient, and sets `dilsay_session` |
+| `GET /api/auth/session` | Session | Returns the current verified patient |
+| `POST /api/auth/logout` | Optional session | Revokes the session and clears the cookie |
+| `GET/PUT /api/whatsapp/consent` | Session | Reads or records the separate health-update preference |
+| `POST /api/snapshot` | Session when available | Saves face/finger data and may queue scan completion |
+| `POST /api/health/analyze` | Session when available | Saves the report and may queue a report-ready link |
+| `POST /api/tests/status` | Session | Saves a test state; ready/completed may queue an update |
+| `POST /api/webhooks/engagelo` | HMAC or webhook secret | Validates, deduplicates, and applies delivery status |
+
+### Configuration and rollout
+
+Copy `.env.example` into the deployment configuration system; never commit populated values. Required when enabled: `ENGAGELO_API_KEY`, `WHATSAPP_PHONE_NUMBER_ID`, `OTP_HASH_SECRET`, and `ENGAGELO_WEBHOOK_SECRET`. Production also needs `PUBLIC_APP_URL`, `AUTH_COOKIE_SECURE=true`, exact `CORS_ORIGINS`, and a stable `WHATSAPP_CONSENT_VERSION`.
+
+Engagelo's public documentation specifies `POST /api/v1/whatsapp/send` with form fields `apiToken`, `phone_number_id`, `phone_number`, and `message`. Template names are reserved in configuration, but the public documentation does not define a template-send request contract. Before production use outside WhatsApp's allowed service window, obtain the account-specific approved-template contract from Engagelo and implement it only inside `services/engagelo.py`.
+
+Rollout order:
+
+1. Deploy with the flag off and create any Firestore indexes requested by production query errors.
+2. Configure secrets in the runtime secret manager and register the HTTPS webhook.
+3. Validate OTP, consent, face/finger scan, report, test status, provider failure, and duplicate-webhook cases in staging.
+4. Enable for internal numbers, inspect delivery records/provider dashboards, then widen access.
+5. Roll back immediately by setting `WHATSAPP_INTEGRATION_ENABLED=false`; core health flows remain available.
+
+Run `python -m unittest test_whatsapp -v` plus the existing backend suite before handover.

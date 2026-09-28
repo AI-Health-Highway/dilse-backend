@@ -1,0 +1,63 @@
+# Run from this directory: gcloud builds submit --config cloudbuild.yaml .
+# Cloud Build's service account needs Artifact Registry Admin (to create the
+# repository once), Cloud Run Admin, and Service Account User on the runtime
+# identity. See README.md for first-time project setup.
+substitutions:
+  _REGION: asia-south1
+  _REPOSITORY: dilse-backend
+  _SERVICE: dilse-backend
+  _ADMIN_SECRET: dilse-admin-key
+
+steps:
+  - id: ensure-artifact-repository
+    name: gcr.io/google.com/cloudsdktool/google-cloud-cli:stable
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        if ! gcloud artifacts repositories describe "${_REPOSITORY}" \
+          --location="${_REGION}" --project="$PROJECT_ID" > /dev/null 2>&1; then
+          gcloud artifacts repositories create "${_REPOSITORY}" \
+            --repository-format=docker \
+            --location="${_REGION}" \
+            --project="$PROJECT_ID" \
+            --description="DilSay backend images"
+        fi
+
+  - id: build-image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:$BUILD_ID
+      - .
+
+  - id: push-image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:$BUILD_ID
+
+  - id: deploy-cloud-run
+    name: gcr.io/google.com/cloudsdktool/google-cloud-cli:stable
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:$BUILD_ID
+      - --region=${_REGION}
+      - --project=$PROJECT_ID
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8080
+      - --memory=1Gi
+      - --update-env-vars=APP_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID
+      - --update-secrets=ADMIN_KEY=${_ADMIN_SECRET}:latest
+      - --quiet
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1200s
