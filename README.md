@@ -348,7 +348,7 @@ The backend reads `backend/.env` locally. Do not commit it, print its values, or
 | `GOOGLE_CLOUD_PROJECT` | Usually | Firestore project; may be inferred from runtime credentials |
 | `FIRESTORE_DB` | No | Firestore database ID; defaults to `(default)` |
 | `MISTRAL_KEY` | For AI routes | Server-side Mistral API key |
-| `ADMIN_KEY` | Production | Protects selected sensitive routes through `x-admin-key` |
+| `ADMIN_KEY` | Optional | Enables selected admin routes with `x-admin-key`; without it, those routes are disabled in production |
 | `CORS_ORIGINS` | Production | Comma-separated browser origins; defaults to `*` |
 | `PUBLIC_BASE_URL` | OAuth deployments | Stable external origin used to build callbacks and redirects |
 | `WEARABLE_STATE_SECRET` | Production OAuth | Stable HMAC secret for OAuth state |
@@ -440,8 +440,8 @@ Minimum manual smoke test:
 
 `Dockerfile` runs the FastAPI app on Cloud Run's `PORT`. `cloudbuild.yaml` creates
 the Artifact Registry repository if needed, builds and pushes an image, then
-deploys it to Cloud Run. The default service and repository are `dilse-backend`
-in `asia-south1`.
+deploys it to Cloud Run. The default service is the existing `aisteth-f3`
+backend in `asia-south1`, using the `cloud-run-source-deploy` repository.
 
 One-time project setup:
 
@@ -452,18 +452,17 @@ One-time project setup:
    ```powershell
    gcloud services enable cloudbuild.googleapis.com run.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com cloudresourcemanager.googleapis.com secretmanager.googleapis.com --project=PROJECT_ID
    ```
-2. Give the Cloud Build service account Artifact Registry Admin (repository
-   creation), Cloud Run Admin (deployment), and Service Account User on the
+2. Give the Cloud Build service account Artifact Registry Writer, Cloud Run
+   Admin (deployment), and Service Account User on the
    Cloud Run runtime service account. Find the build identity with
-   `gcloud builds get-default-service-account --project=PROJECT_ID`.
+   `gcloud builds get-default-service-account --project=PROJECT_ID`. Artifact
+   Registry Admin is also needed if the repository must be created.
 3. Give the Cloud Run runtime service account Cloud Datastore User so the
    backend can read and write Firestore. Cloud Run uses the Compute Engine
    default service account unless you configure another runtime identity.
-4. Create a Secret Manager secret named `dilse-admin-key` with a strong random
-   value and grant the Cloud Run runtime service account Secret Manager Secret
-   Accessor on it. The build maps it to `ADMIN_KEY` at deployment. If you use
-   another secret name, pass `_ADMIN_SECRET` in the build substitutions. Keep
-   the secret value out of source files and build substitutions.
+4. Configure secrets only for features you enable, such as Mistral, wearable
+   OAuth, or WhatsApp delivery. `ADMIN_KEY` is not required for normal app use.
+   Without it, sensitive admin routes are disabled in production.
 
 From this `backend` directory, deploy with one command:
 
@@ -474,23 +473,24 @@ gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml
 Override the defaults when needed:
 
 ```powershell
-gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml --substitutions=_REGION=asia-south1,_REPOSITORY=dilse-backend,_SERVICE=dilse-backend,_ADMIN_SECRET=dilse-admin-key
+gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml --substitutions=_REGION=asia-south1,_REPOSITORY=cloud-run-source-deploy,_SERVICE=aisteth-f3
 ```
 
-The build updates `APP_ENV=production`, `GOOGLE_CLOUD_PROJECT`, and the
-`ADMIN_KEY` secret mapping without clearing other Cloud Run configuration. The
+The build updates `APP_ENV=production` and `GOOGLE_CLOUD_PROJECT`, and removes
+the previous `ADMIN_KEY` secret mapping without clearing other Cloud Run configuration. The
 API is deployed publicly (`--allow-unauthenticated`), matching the current
 public MVP design. Configure exact `CORS_ORIGINS` and any enabled provider
 secrets on the Cloud Run service. Set `PUBLIC_BASE_URL` for wearable OAuth and
-`PUBLIC_APP_URL` for WhatsApp links. Verify `/api/` and `/api/config` on the
-deployed service.
+`PUBLIC_APP_URL` for WhatsApp links. Verify `/api/`, `/api/config`, and
+`/api/health/firestore` on the deployed service. The Firestore check returns
+`503` when the runtime identity cannot read the configured database.
 
 Production deployment requirements:
 
 - Runtime service account with least-privileged Firestore access
 - Secrets supplied from a managed secret store
 - Explicit `CORS_ORIGINS`
-- Stable `PUBLIC_BASE_URL`, `ADMIN_KEY`, and `WEARABLE_STATE_SECRET`
+- Stable `PUBLIC_BASE_URL` and `WEARABLE_STATE_SECRET` for wearable OAuth
 - OAuth callback URLs registered with every enabled provider
 - TLS at the ingress
 - Firestore indexes required by production query combinations
@@ -499,7 +499,7 @@ Production deployment requirements:
 
 FastAPI can mount a static SPA from `STATIC_DIR`, but the current sibling frontend is Next.js and normally runs as a separate service. The canonical setup is Next.js plus this API, connected by the frontend's `/api/*` proxy.
 
-No container definition, infrastructure-as-code, or CI/CD workflow is currently stored in this repository. Record the real deployment command, Cloud Run service, region, project, domains, secret locations, and rollback method before production handover.
+The container definition and Cloud Build pipeline are stored here. Record the deployed Cloud Run URL, project, domains, secret locations, and rollback method before production handover.
 
 ## Security and privacy
 
@@ -516,9 +516,9 @@ Current controls:
 
 Important gaps before production health-data use:
 
-- Normal app flows have no user authentication or per-user authorization.
+- Some app flows still accept unauthenticated requests or lack per-user authorization.
 - Patient creation, snapshots, reports, wearable readings, and several list/read routes are public.
-- `ADMIN_KEY` protection is route-by-route and is disabled entirely when the variable is unset.
+- `ADMIN_KEY` protection is route-by-route. When unset in production, those routes return `403`.
 - CORS defaults to `*`.
 - Phone numbers, health profiles, reports, OAuth tokens, and wearable data are sensitive.
 - OAuth tokens are stored as Firestore document fields; access depends on IAM rather than application-layer encryption.
@@ -647,7 +647,7 @@ For code-level truth, use this order: active implementation, automated tests, th
 
 ## Engagelo and WhatsApp architecture
 
-The integration is feature-flagged with `WHATSAPP_INTEGRATION_ENABLED`. When false, the existing application works and no provider call is attempted. When true, startup validates sender, OTP-hash, and webhook configuration.
+The integration is feature-flagged with `WHATSAPP_INTEGRATION_ENABLED`. When false, no provider call is attempted and the frontend does not complete login; it tells the user OTP is unavailable. When true, startup validates sender, OTP-hash, and webhook configuration.
 
 For temporary local testing, `WHATSAPP_DEV_OTP` enables the OTP screen without contacting Engagelo. The configured six-digit value is hashed into the normal challenge record and verified through the same session flow. It is rejected at startup when `APP_ENV` is `production` or `prod`; remove it before testing real WhatsApp delivery.
 

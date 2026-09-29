@@ -47,7 +47,7 @@ MISTRAL_KEY = os.environ.get("MISTRAL_KEY", "")
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 # The app itself is open (public MVP). Only sensitive data endpoints that touch
 # the `patients` collection, logs, and stats require this admin key.
-# Unset → those endpoints are open too (local dev). Set via deploy.sh.
+# When unset, those endpoints are disabled in production and open only locally.
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 WHATSAPP_SETTINGS = EngageloSettings.from_env()
 APP_ENV = os.environ.get("APP_ENV", "production" if os.environ.get("K_SERVICE") else "development").strip().lower()
@@ -179,7 +179,9 @@ logger = logging.getLogger("aisteth")
 
 def require_admin(request: Request) -> None:
     if not ADMIN_KEY:
-        return  # unset → open (local dev)
+        if APP_ENV in {"production", "prod"}:
+            raise HTTPException(status_code=403, detail="Admin endpoint is disabled")
+        return  # Local development only.
     supplied = request.headers.get("x-admin-key", "")
     if not secrets.compare_digest(supplied, ADMIN_KEY):
         raise HTTPException(status_code=403, detail="Admin key required")
@@ -401,6 +403,17 @@ async def config() -> Dict[str, Any]:
 
 
 # ── Assessments ───────────────────────────────────────────
+
+@api.get("/health/firestore")
+async def firestore_health() -> Dict[str, bool]:
+    """Verify the runtime identity can reach the configured Firestore database."""
+    try:
+        await get_db().collection(COL_OTP_CHALLENGES).document("__connectivity__").get()
+    except Exception as exc:
+        logger.warning("firestore_health_failed error=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Firestore unavailable") from None
+    return {"ok": True}
+
 
 @api.post("/save-assessment")
 async def save_assessment(request: Request) -> Dict[str, Any]:

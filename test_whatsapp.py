@@ -42,6 +42,25 @@ def settings(*, retries=0):
     return EngageloSettings(True, "https://provider.test", "secret-api-key", "sender-id", "91", 1, retries, {})
 
 
+class AdminAccessTests(unittest.TestCase):
+    def test_admin_routes_are_disabled_without_key_in_production(self):
+        with patch.object(server, "APP_ENV", "production"), patch.object(server, "ADMIN_KEY", ""):
+            with self.assertRaises(HTTPException) as raised:
+                server.require_admin(request())
+        self.assertEqual(raised.exception.status_code, 403)
+
+    def test_admin_routes_remain_available_without_key_in_development(self):
+        with patch.object(server, "APP_ENV", "development"), patch.object(server, "ADMIN_KEY", ""):
+            server.require_admin(request())
+
+    def test_configured_admin_key_is_enforced(self):
+        with patch.object(server, "APP_ENV", "production"), patch.object(server, "ADMIN_KEY", "test-key"):
+            with self.assertRaises(HTTPException) as raised:
+                server.require_admin(request())
+            self.assertEqual(raised.exception.status_code, 403)
+            server.require_admin(request(headers={"x-admin-key": "test-key"}))
+
+
 class EngageloClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_success_uses_documented_form_contract(self):
         seen = {}
