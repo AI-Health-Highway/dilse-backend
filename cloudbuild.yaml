@@ -1,11 +1,11 @@
-# Run from this directory: gcloud builds submit --config cloudbuild.yaml .
+# Run from this directory: gcloud builds submit . --project=aisteth-development --config=cloudbuild.yaml
 # Cloud Build's service account needs Artifact Registry Writer, Cloud Run Admin,
 # and Service Account User on the runtime identity. Creating a new repository
 # also requires Artifact Registry Admin. See README.md for project setup.
 substitutions:
   _REGION: asia-south1
   _REPOSITORY: cloud-run-source-deploy
-  _SERVICE: aisteth-f3
+  _SERVICE: dilse-fastapi
 
 steps:
   - id: ensure-artifact-repository
@@ -52,7 +52,7 @@ steps:
       - --allow-unauthenticated
       - --port=8080
       - --memory=1Gi
-      - --update-env-vars=APP_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,WHATSAPP_INTEGRATION_ENABLED=false,WHATSAPP_DEV_OTP=555666,ALLOW_FIXED_OTP_IN_PRODUCTION=true
+      - --update-env-vars=APP_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,FIRESTORE_DB=(default),WHATSAPP_INTEGRATION_ENABLED=false,WHATSAPP_DEV_OTP=555666,ALLOW_FIXED_OTP_IN_PRODUCTION=true
       - --remove-secrets=ADMIN_KEY
       - --quiet
 

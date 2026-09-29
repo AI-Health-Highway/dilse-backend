@@ -409,7 +409,7 @@ async def config() -> Dict[str, Any]:
 async def firestore_health() -> Dict[str, bool]:
     """Verify the runtime identity can reach the configured Firestore database."""
     try:
-        await get_db().collection(COL_OTP_CHALLENGES).document("__connectivity__").get()
+        await get_db().collection(COL_OTP_CHALLENGES).document("connectivity_probe").get()
     except Exception as exc:
         logger.warning("firestore_health_failed error=%s", type(exc).__name__)
         raise HTTPException(status_code=503, detail="Firestore unavailable") from None

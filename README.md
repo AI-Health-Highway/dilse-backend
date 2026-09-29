@@ -442,8 +442,9 @@ Minimum manual smoke test:
 
 `Dockerfile` runs the FastAPI app on Cloud Run's `PORT`. `cloudbuild.yaml` creates
 the Artifact Registry repository if needed, builds and pushes an image, then
-deploys it to Cloud Run. The default service is the existing `aisteth-f3`
-backend in `asia-south1`, using the `cloud-run-source-deploy` repository.
+deploys it to Cloud Run. The default service is the existing `dilse-fastapi`
+backend in project `aisteth-development`, region `asia-south1`, using the
+`cloud-run-source-deploy` repository.
 
 One-time project setup:
 
@@ -469,13 +470,13 @@ One-time project setup:
 From this `backend` directory, deploy with one command:
 
 ```powershell
-gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml
+gcloud builds submit . --project=aisteth-development --config=cloudbuild.yaml
 ```
 
 Override the defaults when needed:
 
 ```powershell
-gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml --substitutions=_REGION=asia-south1,_REPOSITORY=cloud-run-source-deploy,_SERVICE=aisteth-f3
+gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml --substitutions=_REGION=asia-south1,_REPOSITORY=cloud-run-source-deploy,_SERVICE=SERVICE_NAME
 ```
 
 The build updates `APP_ENV=production`, `GOOGLE_CLOUD_PROJECT`, and the temporary
