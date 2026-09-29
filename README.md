@@ -349,6 +349,8 @@ The backend reads `backend/.env` locally. Do not commit it, print its values, or
 | `FIRESTORE_DB` | No | Firestore database ID; defaults to `(default)` |
 | `MISTRAL_KEY` | For AI routes | Server-side Mistral API key |
 | `ADMIN_KEY` | Optional | Enables selected admin routes with `x-admin-key`; without it, those routes are disabled in production |
+| `WHATSAPP_DEV_OTP` | Temporary testing | Fixed six-digit OTP; the current Cloud Build config sets `555666` |
+| `ALLOW_FIXED_OTP_IN_PRODUCTION` | Fixed OTP on Cloud Run | Explicitly allows that temporary fixed code with `APP_ENV=production` |
 | `CORS_ORIGINS` | Production | Comma-separated browser origins; defaults to `*` |
 | `PUBLIC_BASE_URL` | OAuth deployments | Stable external origin used to build callbacks and redirects |
 | `WEARABLE_STATE_SECRET` | Production OAuth | Stable HMAC secret for OAuth state |
@@ -476,7 +478,8 @@ Override the defaults when needed:
 gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml --substitutions=_REGION=asia-south1,_REPOSITORY=cloud-run-source-deploy,_SERVICE=aisteth-f3
 ```
 
-The build updates `APP_ENV=production` and `GOOGLE_CLOUD_PROJECT`, and removes
+The build updates `APP_ENV=production`, `GOOGLE_CLOUD_PROJECT`, and the temporary
+fixed OTP settings, and removes
 the previous `ADMIN_KEY` secret mapping without clearing other Cloud Run configuration. The
 API is deployed publicly (`--allow-unauthenticated`), matching the current
 public MVP design. Configure exact `CORS_ORIGINS` and any enabled provider
@@ -647,9 +650,9 @@ For code-level truth, use this order: active implementation, automated tests, th
 
 ## Engagelo and WhatsApp architecture
 
-The integration is feature-flagged with `WHATSAPP_INTEGRATION_ENABLED`. When false, no provider call is attempted and the frontend does not complete login; it tells the user OTP is unavailable. When true, startup validates sender, OTP-hash, and webhook configuration.
+The integration is feature-flagged with `WHATSAPP_INTEGRATION_ENABLED`. When false, no provider call is attempted. Login remains available only if a fixed OTP is configured. When true, startup validates sender, OTP-hash, and webhook configuration.
 
-For temporary local testing, `WHATSAPP_DEV_OTP` enables the OTP screen without contacting Engagelo. The configured six-digit value is hashed into the normal challenge record and verified through the same session flow. It is rejected at startup when `APP_ENV` is `production` or `prod`; remove it before testing real WhatsApp delivery.
+For temporary testing, `WHATSAPP_DEV_OTP` enables the OTP screen without contacting Engagelo. The configured six-digit value is hashed into the normal Firestore challenge record and verified through the normal session flow. The current Cloud Build config explicitly allows `555666` on Cloud Run with `ALLOW_FIXED_OTP_IN_PRODUCTION=true`. This fixed code does not prove ownership of a phone number: anyone who knows a number and the code can sign in as that number. Remove both fixed-OTP settings and enable real delivery before using the service with real patient data.
 
 ```text
 PWA (same-origin cookie)

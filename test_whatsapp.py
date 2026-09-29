@@ -150,10 +150,11 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         token = response.headers["set-cookie"].split("dilsay_session=", 1)[1].split(";", 1)[0]
         return result["row"], token
 
-    async def test_temporary_development_otp_creates_normal_session_without_provider(self):
-        with patch.object(server, "WHATSAPP_DEV_OTP", "555666"):
+    async def test_fixed_otp_creates_normal_session_without_provider_in_production(self):
+        with patch.object(server, "APP_ENV", "production"), patch.object(server, "WHATSAPP_DEV_OTP", "555666"):
             result = await server.request_whatsapp_otp(request({"phone": "9876543210"}))
             self.assertTrue(result["success"])
+            self.assertEqual(result["message"], "OTP ready")
             self.assertEqual(self.sent, [])
             response = Response()
             verified = await server.verify_whatsapp_otp(request({"phone": "9876543210", "otp": "555666"}), response)

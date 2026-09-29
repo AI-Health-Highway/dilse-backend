@@ -52,10 +52,11 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 WHATSAPP_SETTINGS = EngageloSettings.from_env()
 APP_ENV = os.environ.get("APP_ENV", "production" if os.environ.get("K_SERVICE") else "development").strip().lower()
 WHATSAPP_DEV_OTP = os.environ.get("WHATSAPP_DEV_OTP", "555666" if APP_ENV == "development" else "").strip()
+ALLOW_FIXED_OTP_IN_PRODUCTION = os.environ.get("ALLOW_FIXED_OTP_IN_PRODUCTION", "false").strip().lower() in {"1", "true", "yes", "on"}
 if WHATSAPP_DEV_OTP and not (len(WHATSAPP_DEV_OTP) == 6 and WHATSAPP_DEV_OTP.isdigit()):
     raise EngageloConfigurationError("WHATSAPP_DEV_OTP must be exactly 6 digits")
-if WHATSAPP_DEV_OTP and APP_ENV in {"production", "prod"}:
-    raise EngageloConfigurationError("WHATSAPP_DEV_OTP is forbidden in production")
+if WHATSAPP_DEV_OTP and APP_ENV in {"production", "prod"} and not ALLOW_FIXED_OTP_IN_PRODUCTION:
+    raise EngageloConfigurationError("Set ALLOW_FIXED_OTP_IN_PRODUCTION=true to use a fixed OTP in production")
 WHATSAPP_AUTH_ENABLED = WHATSAPP_SETTINGS.enabled or bool(WHATSAPP_DEV_OTP)
 OTP_TTL_SECONDS = max(60, int(os.environ.get("OTP_TTL_SECONDS", "300")))
 OTP_MAX_ATTEMPTS = max(1, int(os.environ.get("OTP_MAX_ATTEMPTS", "5")))
@@ -624,7 +625,7 @@ async def request_whatsapp_otp(request: Request) -> Dict[str, Any]:
             await fs_put(COL_OTP_CHALLENGES, challenge)
             raise HTTPException(status_code=503, detail="Unable to send OTP. Please try again.")
     logger.info("otp_requested phone=%s", mask_phone(phone))
-    return {"success": True, "message": "OTP sent", "expiresIn": OTP_TTL_SECONDS, "resendAfter": OTP_RESEND_COOLDOWN_SECONDS}
+    return {"success": True, "message": "OTP ready" if WHATSAPP_DEV_OTP else "OTP sent", "expiresIn": OTP_TTL_SECONDS, "resendAfter": OTP_RESEND_COOLDOWN_SECONDS}
 
 
 @api.post("/auth/whatsapp/verify-otp")
