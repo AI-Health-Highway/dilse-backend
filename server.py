@@ -51,7 +51,7 @@ CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 WHATSAPP_SETTINGS = EngageloSettings.from_env()
 APP_ENV = os.environ.get("APP_ENV", "production" if os.environ.get("K_SERVICE") else "development").strip().lower()
-WHATSAPP_DEV_OTP = os.environ.get("WHATSAPP_DEV_OTP", "555666" if APP_ENV == "development" else "").strip()
+WHATSAPP_DEV_OTP = os.environ.get("WHATSAPP_DEV_OTP", "555666" if APP_ENV == "development" and not WHATSAPP_SETTINGS.enabled else "").strip()
 ALLOW_FIXED_OTP_IN_PRODUCTION = os.environ.get("ALLOW_FIXED_OTP_IN_PRODUCTION", "false").strip().lower() in {"1", "true", "yes", "on"}
 if WHATSAPP_DEV_OTP and not (len(WHATSAPP_DEV_OTP) == 6 and WHATSAPP_DEV_OTP.isdigit()):
     raise EngageloConfigurationError("WHATSAPP_DEV_OTP must be exactly 6 digits")
@@ -69,8 +69,6 @@ PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "").rstrip("/")
 CONSENT_VERSION = os.environ.get("WHATSAPP_CONSENT_VERSION", "2026-09-01")
 if WHATSAPP_AUTH_ENABLED and not OTP_HASH_SECRET:
     raise EngageloConfigurationError("Missing required WhatsApp configuration: OTP_HASH_SECRET")
-if WHATSAPP_SETTINGS.enabled and not ENGAGELO_WEBHOOK_SECRET:
-    raise EngageloConfigurationError("Missing required WhatsApp configuration: ENGAGELO_WEBHOOK_SECRET")
 
 _db: Optional[firestore.AsyncClient] = None
 
@@ -587,12 +585,13 @@ async def stats(request: Request) -> Dict[str, Any]:
 # ── WhatsApp OTP authentication ───────────────────────────
 
 @api.post("/auth/whatsapp/request-otp")
+@api.post("/engagelo/request-otp")
 async def request_whatsapp_otp(request: Request) -> Dict[str, Any]:
     if not WHATSAPP_AUTH_ENABLED:
         raise HTTPException(status_code=503, detail={"code": "WHATSAPP_DISABLED", "message": "WhatsApp verification is not enabled"})
     body = await request.json()
     try:
-        phone = _normalize_phone(body.get("phone") or "")
+        phone = _normalize_phone(body.get("phone") or body.get("phone_number") or "")
     except ValueError:
         raise HTTPException(status_code=400, detail="Enter a valid mobile number")
     challenge_id = hashlib.sha256(phone.encode("utf-8")).hexdigest()
@@ -601,7 +600,10 @@ async def request_whatsapp_otp(request: Request) -> Dict[str, Any]:
     if existing and current_time - float(existing.get("sent_at_epoch") or 0) < OTP_RESEND_COOLDOWN_SECONDS:
         retry_after = max(1, OTP_RESEND_COOLDOWN_SECONDS - int(current_time - float(existing.get("sent_at_epoch") or 0)))
         raise HTTPException(status_code=429, detail={"code": "OTP_COOLDOWN", "message": "Please wait before requesting another code", "retry_after": retry_after})
-    otp = WHATSAPP_DEV_OTP or f"{secrets.randbelow(1_000_000):06d}"
+    development_otp = WHATSAPP_DEV_OTP if not WHATSAPP_SETTINGS.enabled else ""
+    otp = development_otp or f"{secrets.randbelow(1_000_000):06d}"
+    while not development_otp and existing and hmac.compare_digest(existing.get("otp_hash") or "", _secret_hash(phone, otp)):
+        otp = f"{secrets.randbelow(1_000_000):06d}"
     challenge = {
         "id": challenge_id,
         "phone": phone,
@@ -615,7 +617,7 @@ async def request_whatsapp_otp(request: Request) -> Dict[str, Any]:
         "updated_at": now_iso(),
     }
     await fs_put(COL_OTP_CHALLENGES, challenge)
-    if WHATSAPP_DEV_OTP:
+    if development_otp:
         logger.warning("development_otp_enabled phone=%s; no WhatsApp message sent", mask_phone(phone))
     else:
         try:
@@ -623,9 +625,10 @@ async def request_whatsapp_otp(request: Request) -> Dict[str, Any]:
         except EngageloDeliveryError as exc:
             challenge.update({"delivery_error": exc.safe_code, "updated_at": now_iso()})
             await fs_put(COL_OTP_CHALLENGES, challenge)
-            raise HTTPException(status_code=503, detail="Unable to send OTP. Please try again.")
+            detail = "Unable to send OTP. Please try again."
+            raise HTTPException(status_code=503, detail=detail)
     logger.info("otp_requested phone=%s", mask_phone(phone))
-    return {"success": True, "message": "OTP ready" if WHATSAPP_DEV_OTP else "OTP sent", "expiresIn": OTP_TTL_SECONDS, "resendAfter": OTP_RESEND_COOLDOWN_SECONDS}
+    return {"success": True, "message": "OTP ready" if development_otp else "OTP sent", "expiresIn": OTP_TTL_SECONDS, "resendAfter": OTP_RESEND_COOLDOWN_SECONDS}
 
 
 @api.post("/auth/whatsapp/verify-otp")

@@ -349,7 +349,7 @@ The backend reads `backend/.env` locally. Do not commit it, print its values, or
 | `FIRESTORE_DB` | No | Firestore database ID; defaults to `(default)` |
 | `MISTRAL_KEY` | For AI routes | Server-side Mistral API key |
 | `ADMIN_KEY` | Optional | Enables selected admin routes with `x-admin-key`; without it, those routes are disabled in production |
-| `WHATSAPP_DEV_OTP` | Temporary testing | Fixed six-digit OTP; the current Cloud Build config sets `555666` |
+| `WHATSAPP_DEV_OTP` | Temporary testing | Fixed six-digit OTP; set it explicitly to use `555666` on Cloud Run |
 | `ALLOW_FIXED_OTP_IN_PRODUCTION` | Fixed OTP on Cloud Run | Explicitly allows that temporary fixed code with `APP_ENV=production` |
 | `CORS_ORIGINS` | Production | Comma-separated browser origins; defaults to `*` |
 | `PUBLIC_BASE_URL` | OAuth deployments | Stable external origin used to build callbacks and redirects |
@@ -479,8 +479,8 @@ Override the defaults when needed:
 gcloud builds submit . --project=PROJECT_ID --config=cloudbuild.yaml --substitutions=_REGION=asia-south1,_REPOSITORY=cloud-run-source-deploy,_SERVICE=SERVICE_NAME
 ```
 
-The build updates `APP_ENV=production`, `GOOGLE_CLOUD_PROJECT`, and the temporary
-fixed OTP settings, and removes
+The build updates `APP_ENV=production` and `GOOGLE_CLOUD_PROJECT`, preserves
+existing WhatsApp runtime settings, and removes
 the previous `ADMIN_KEY` secret mapping without clearing other Cloud Run configuration. The
 API is deployed publicly (`--allow-unauthenticated`), matching the current
 public MVP design. Configure exact `CORS_ORIGINS` and any enabled provider
@@ -651,9 +651,9 @@ For code-level truth, use this order: active implementation, automated tests, th
 
 ## Engagelo and WhatsApp architecture
 
-The integration is feature-flagged with `WHATSAPP_INTEGRATION_ENABLED`. When false, no provider call is attempted. Login remains available only if a fixed OTP is configured. When true, startup validates sender, OTP-hash, and webhook configuration.
+The integration is feature-flagged with `WHATSAPP_INTEGRATION_ENABLED`. When false, no provider call is attempted. Login remains available only if a fixed OTP is configured. When true, startup validates the Engagelo API key, phone number ID, and OTP hash secret. Sending text does not require a webhook or template configuration.
 
-For temporary testing, `WHATSAPP_DEV_OTP` enables the OTP screen without contacting Engagelo. The configured six-digit value is hashed into the normal Firestore challenge record and verified through the normal session flow. The current Cloud Build config explicitly allows `555666` on Cloud Run with `ALLOW_FIXED_OTP_IN_PRODUCTION=true`. This fixed code does not prove ownership of a phone number: anyone who knows a number and the code can sign in as that number. Remove both fixed-OTP settings and enable real delivery before using the service with real patient data.
+For temporary testing, `WHATSAPP_DEV_OTP` enables the OTP screen without contacting Engagelo. The configured six-digit value is hashed into the normal Firestore challenge record and verified through the normal session flow. Existing Cloud Run services may still have `555666` and `ALLOW_FIXED_OTP_IN_PRODUCTION=true` set; Cloud Build now preserves those settings instead of adding them. A fixed code does not prove ownership of a phone number: anyone who knows a number and the code can sign in as that number. Clear `WHATSAPP_DEV_OTP`, set `ALLOW_FIXED_OTP_IN_PRODUCTION=false`, and enable real delivery before using the service with real patient data.
 
 ```text
 PWA (same-origin cookie)
@@ -661,7 +661,7 @@ PWA (same-origin cookie)
      -> Firestore: OTP hashes, hashed sessions, consent audit, deliveries
      -> services/engagelo.py: the only Engagelo HTTP boundary
         -> Engagelo documented direct-send endpoint
-Engagelo delivery event
+Optional Engagelo delivery event (only if ENGAGELO_WEBHOOK_SECRET is configured)
   -> authenticated /api/webhooks/engagelo
      -> idempotent delivery-state update
 ```
@@ -696,20 +696,22 @@ Engagelo delivery event
 | `POST /api/snapshot` | Session when available | Saves face/finger data and may queue scan completion |
 | `POST /api/health/analyze` | Session when available | Saves the report and may queue a report-ready link |
 | `POST /api/tests/status` | Session | Saves a test state; ready/completed may queue an update |
-| `POST /api/webhooks/engagelo` | HMAC or webhook secret | Validates, deduplicates, and applies delivery status |
+| `POST /api/webhooks/engagelo` | Optional HMAC or webhook secret | Validates, deduplicates, and applies delivery status when configured |
 
 ### Configuration and rollout
 
-Copy `.env.example` into the deployment configuration system; never commit populated values. Required when enabled: `ENGAGELO_API_KEY`, `WHATSAPP_PHONE_NUMBER_ID`, `OTP_HASH_SECRET`, and `ENGAGELO_WEBHOOK_SECRET`. Production also needs `PUBLIC_APP_URL`, `AUTH_COOKIE_SECURE=true`, exact `CORS_ORIGINS`, and a stable `WHATSAPP_CONSENT_VERSION`.
+Copy `.env.example` into the deployment configuration system; never commit populated values. For text delivery, set `WHATSAPP_INTEGRATION_ENABLED=true`, `ENGAGELO_API_KEY`, `WHATSAPP_PHONE_NUMBER_ID`, and a stable `OTP_HASH_SECRET`; clear `WHATSAPP_DEV_OTP`. The API key stays on the backend. `ENGAGELO_WEBHOOK_SECRET` is optional and only enables delivery callbacks. Production also needs `PUBLIC_APP_URL`, `AUTH_COOKIE_SECURE=true`, exact `CORS_ORIGINS`, and a stable `WHATSAPP_CONSENT_VERSION`. Cloud Build preserves the service's existing WhatsApp settings, so configure these on Cloud Run before deployment or update them afterward.
 
-Engagelo's public documentation specifies `POST /api/v1/whatsapp/send` with form fields `apiToken`, `phone_number_id`, `phone_number`, and `message`. Template names are reserved in configuration, but the public documentation does not define a template-send request contract. Before production use outside WhatsApp's allowed service window, obtain the account-specific approved-template contract from Engagelo and implement it only inside `services/engagelo.py`.
+OTP delivery uses `POST https://bot.engagelo.com/api/v1/whatsapp/send/template` with form fields `apiToken`, `phone_number_id`, `template_id` (454203), `templateVariable-OTP-1` (a fresh six-digit code), and `phone_number` (normalized from the UI). Configure `ENGAGELO_OTP_TEMPLATE_ID` alongside the existing provider settings. Enabled provider delivery always uses random codes even if a fixed development OTP is configured. Other health updates still use the plain text endpoint.
+
+The UI can call `POST /api/engagelo/request-otp` (or the existing `/api/auth/whatsapp/request-otp`) with JSON `{"phone": "9876543210"}` or `{"phone_number": "919876543210"}`. Verify using `POST /api/auth/whatsapp/verify-otp` with `{"phone": "9876543210", "otp": "<received code>"}`. Codes expire after five minutes by default; resends have a 30-second cooldown. Provider credentials and OTPs are never returned to the UI.
 
 Rollout order:
 
 1. Deploy with the flag off and create any Firestore indexes requested by production query errors.
-2. Configure secrets in the runtime secret manager and register the HTTPS webhook.
-3. Validate OTP, consent, face/finger scan, report, test status, provider failure, and duplicate-webhook cases in staging.
+2. Configure the API key, phone number ID, and OTP hash secret on Cloud Run; clear the fixed OTP settings.
+3. Validate OTP template delivery, consent, face/finger scan, report, test status, and provider failure cases in staging.
 4. Enable for internal numbers, inspect delivery records/provider dashboards, then widen access.
-5. Roll back immediately by setting `WHATSAPP_INTEGRATION_ENABLED=false`; core health flows remain available.
+5. If delivery fails, disable the integration while investigating; OTP login then requires a separately configured fixed test code.
 
 Run `python -m unittest test_whatsapp -v` plus the existing backend suite before handover.

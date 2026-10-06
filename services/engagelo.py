@@ -38,7 +38,7 @@ class EngageloSettings:
     default_country_code: str
     timeout_seconds: float
     max_retries: int
-    templates: Dict[str, str]
+    otp_template_id: str = "454203"
 
     @classmethod
     def from_env(cls) -> "EngageloSettings":
@@ -47,22 +47,17 @@ class EngageloSettings:
             enabled=enabled,
             base_url=os.environ.get("ENGAGELO_BASE_URL", "https://bot.engagelo.com").rstrip("/"),
             api_key=os.environ.get("ENGAGELO_API_KEY", "").strip(),
-            phone_number_id=(os.environ.get("WHATSAPP_PHONE_NUMBER_ID") or os.environ.get("ENGAGELO_WHATSAPP_ACCOUNT_ID", "")).strip(),
+            phone_number_id=os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip(),
             default_country_code=os.environ.get("WHATSAPP_DEFAULT_COUNTRY_CODE", "91").strip().lstrip("+"),
             timeout_seconds=float(os.environ.get("ENGAGELO_TIMEOUT_SECONDS", "10")),
             max_retries=max(0, int(os.environ.get("ENGAGELO_MAX_RETRIES", "2"))),
-            templates={
-                "otp": os.environ.get("ENGAGELO_TEMPLATE_OTP", "").strip(),
-                "scan_complete": os.environ.get("ENGAGELO_TEMPLATE_SCAN_COMPLETE", "").strip(),
-                "report_ready": os.environ.get("ENGAGELO_TEMPLATE_REPORT_READY", "").strip(),
-                "test_update": os.environ.get("ENGAGELO_TEMPLATE_TEST_UPDATE", "").strip(),
-                "reminder": os.environ.get("ENGAGELO_TEMPLATE_REMINDER", "").strip(),
-            },
+            otp_template_id=os.environ.get("ENGAGELO_OTP_TEMPLATE_ID", "454203").strip(),
         )
         if settings.enabled:
             missing = [name for name, value in {
                 "ENGAGELO_API_KEY": settings.api_key,
                 "WHATSAPP_PHONE_NUMBER_ID": settings.phone_number_id,
+                "ENGAGELO_OTP_TEMPLATE_ID": settings.otp_template_id,
             }.items() if not value]
             if missing:
                 raise EngageloConfigurationError("Missing required WhatsApp configuration: " + ", ".join(missing))
@@ -83,27 +78,37 @@ class EngageloClient:
         self.transport = transport
 
     async def send_message(self, phone: str, message: str, *, message_type: str) -> Dict[str, Any]:
+        return await self._send(phone, {"message": message}, message_type=message_type, path="/api/v1/whatsapp/send")
+
+    async def _send(self, phone: str, fields: Dict[str, str], *, message_type: str, path: str) -> Dict[str, Any]:
         if not self.settings.enabled:
             return {"sent": False, "disabled": True, "provider_message_id": None}
         payload = {
             "apiToken": self.settings.api_key,
             "phone_number_id": self.settings.phone_number_id,
             "phone_number": "".join(ch for ch in phone if ch.isdigit()),
-            "message": message,
+            **fields,
         }
-        endpoint = f"{self.settings.base_url}/api/v1/whatsapp/send"
+        endpoint = f"{self.settings.base_url}{path}"
         last_error: Optional[Exception] = None
         for attempt in range(self.settings.max_retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=self.settings.timeout_seconds, transport=self.transport) as client:
+                async with httpx.AsyncClient(timeout=self.settings.timeout_seconds, transport=self.transport, trust_env=False) as client:
                     response = await client.post(endpoint, data=payload)
                 if response.status_code == 429 or response.status_code >= 500:
                     raise EngageloDeliveryError("Transient provider failure", status_code=response.status_code, safe_code="transient_provider_error")
                 if response.status_code >= 400:
                     raise EngageloDeliveryError("Provider rejected the message", status_code=response.status_code, safe_code="provider_rejected")
-                data = response.json()
+                try:
+                    data = response.json()
+                except ValueError as exc:
+                    raise EngageloDeliveryError("Invalid provider response", safe_code="provider_rejected") from exc
+                if not isinstance(data, dict):
+                    raise EngageloDeliveryError("Invalid provider response", safe_code="provider_rejected")
                 if str(data.get("status")) != "1":
-                    raise EngageloDeliveryError("Provider did not accept the message", status_code=response.status_code, safe_code="provider_rejected")
+                    provider_message = str(data.get("message") or "").lower()
+                    safe_code = "outside_24_hour_window" if "outside 24 hour window" in provider_message else "provider_rejected"
+                    raise EngageloDeliveryError("Provider did not accept the message", status_code=response.status_code, safe_code=safe_code)
                 provider_id = data.get("wa_message_id") or data.get("message_id")
                 logger.info("whatsapp_sent type=%s phone=%s status=%s provider_id=%s retry=%s", message_type, mask_phone(phone), response.status_code, provider_id or "none", attempt)
                 return {"sent": True, "disabled": False, "provider_message_id": provider_id, "provider_status": data.get("message")}
@@ -119,7 +124,10 @@ class EngageloClient:
         raise EngageloDeliveryError("Unable to reach WhatsApp provider", safe_code="provider_unavailable") from last_error
 
     async def send_otp(self, phone: str, otp: str, ttl_minutes: int) -> Dict[str, Any]:
-        return await self.send_message(phone, f"Your DilSay verification code is {otp}. It expires in {ttl_minutes} minutes. Do not share this code.", message_type="otp")
+        return await self._send(phone, {
+            "template_id": self.settings.otp_template_id,
+            "templateVariable-OTP-1": otp,
+        }, message_type="otp", path="/api/v1/whatsapp/send/template")
 
     async def send_scan_complete(self, phone: str) -> Dict[str, Any]:
         return await self.send_message(phone, "Your DilSay heart check is complete. Open DilSay to view your results.", message_type="scan_complete")

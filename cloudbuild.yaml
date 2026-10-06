@@ -52,7 +52,7 @@ steps:
       - --allow-unauthenticated
       - --port=8080
       - --memory=1Gi
-      - --update-env-vars=APP_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,FIRESTORE_DB=(default),WHATSAPP_INTEGRATION_ENABLED=false,WHATSAPP_DEV_OTP=555666,ALLOW_FIXED_OTP_IN_PRODUCTION=true
+      - --update-env-vars=APP_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,FIRESTORE_DB=(default)
       - --remove-secrets=ADMIN_KEY
       - --quiet
 

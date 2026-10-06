@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+*.log
+test_*.py
+backend_test.py
+models
+scripts
+storage

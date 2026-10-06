@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import time
 import unittest
+from urllib.parse import parse_qs
 from collections import defaultdict
 from copy import deepcopy
 from unittest.mock import patch
@@ -39,7 +41,7 @@ def request(body=None, *, cookie="", headers=None, path="/api/test", method="POS
 
 
 def settings(*, retries=0):
-    return EngageloSettings(True, "https://provider.test", "secret-api-key", "sender-id", "91", 1, retries, {})
+    return EngageloSettings(True, "https://provider.test", "secret-api-key", "sender-id", "91", 1, retries)
 
 
 class AdminAccessTests(unittest.TestCase):
@@ -62,6 +64,30 @@ class AdminAccessTests(unittest.TestCase):
 
 
 class EngageloClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_otp_uses_exact_template_form_contract(self):
+        async def handler(req):
+            self.assertEqual(str(req.url), "https://provider.test/api/v1/whatsapp/send/template")
+            self.assertEqual(parse_qs((await req.aread()).decode()), {
+                "apiToken": ["secret-api-key"], "phone_number_id": ["sender-id"],
+                "phone_number": ["919876543210"], "template_id": ["454203"],
+                "templateVariable-OTP-1": ["123456"],
+            })
+            return httpx.Response(200, json={"status": "1"})
+        result = await EngageloClient(settings(), httpx.MockTransport(handler)).send_otp("+919876543210", "123456", 5)
+        self.assertTrue(result["sent"])
+
+    def test_text_sender_needs_only_api_key_and_phone_number_id(self):
+        env = {
+            "WHATSAPP_INTEGRATION_ENABLED": "true",
+            "ENGAGELO_API_KEY": "test-key",
+            "WHATSAPP_PHONE_NUMBER_ID": "test-phone-id",
+            "ENGAGELO_WEBHOOK_SECRET": "",
+        }
+        with patch.dict(os.environ, env):
+            configured = EngageloSettings.from_env()
+        self.assertTrue(configured.enabled)
+        self.assertEqual(configured.phone_number_id, "test-phone-id")
+
     async def test_success_uses_documented_form_contract(self):
         seen = {}
 
@@ -83,6 +109,14 @@ class EngageloClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(EngageloDeliveryError) as raised:
             await EngageloClient(settings(retries=2), httpx.MockTransport(handler)).send_test_update("+919876543210")
         self.assertEqual(raised.exception.safe_code, "provider_rejected")
+
+    async def test_closed_conversation_window_has_safe_error_code(self):
+        async def handler(_req):
+            return httpx.Response(200, json={"status": "0", "message": "Sending message outside 24 hour window is not allowed. You can only send template message to this user."})
+
+        with self.assertRaises(EngageloDeliveryError) as raised:
+            await EngageloClient(settings(), httpx.MockTransport(handler)).send_otp("+919876543210", "123456", 5)
+        self.assertEqual(raised.exception.safe_code, "outside_24_hour_window")
 
 
 class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -151,7 +185,7 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         return result["row"], token
 
     async def test_fixed_otp_creates_normal_session_without_provider_in_production(self):
-        with patch.object(server, "APP_ENV", "production"), patch.object(server, "WHATSAPP_DEV_OTP", "555666"):
+        with patch.object(server, "APP_ENV", "production"), patch.object(server, "WHATSAPP_DEV_OTP", "555666"), patch.object(server, "WHATSAPP_SETTINGS", EngageloSettings(False, "https://provider.test", "", "", "91", 1, 0)):
             result = await server.request_whatsapp_otp(request({"phone": "9876543210"}))
             self.assertTrue(result["success"])
             self.assertEqual(result["message"], "OTP ready")
@@ -160,6 +194,16 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
             verified = await server.verify_whatsapp_otp(request({"phone": "9876543210", "otp": "555666"}), response)
         self.assertTrue(verified["row"]["phone_verified_at"])
         self.assertIn("dilsay_session=", response.headers["set-cookie"])
+
+    async def test_resend_is_fresh_and_enabled_provider_ignores_fixed_code(self):
+        with patch.object(server, "WHATSAPP_DEV_OTP", "555666"), patch.object(server.secrets, "randbelow", side_effect=[123456, 123456, 654321]):
+            await server.request_whatsapp_otp(request({"phone_number": "9876543210"}))
+            challenge = next(iter(self.db[server.COL_OTP_CHALLENGES].values()))
+            challenge["sent_at_epoch"] -= server.OTP_RESEND_COOLDOWN_SECONDS + 1
+            await server.request_whatsapp_otp(request({"phone": "9876543210"}))
+        self.assertEqual([row[2] for row in self.sent], ["123456", "654321"])
+        with self.assertRaises(HTTPException):
+            await server.verify_whatsapp_otp(request({"phone": "9876543210", "otp": "123456"}), Response())
 
     async def test_phone_normalization_and_otp_success_replay_and_cooldown(self):
         self.assertEqual(server._normalize_phone("98765 43210"), "+919876543210")
