@@ -715,3 +715,22 @@ Rollout order:
 5. If delivery fails, disable the integration while investigating; OTP login then requires a separately configured fixed test code.
 
 Run `python -m unittest test_whatsapp -v` plus the existing backend suite before handover.
+
+## Verified heart-health MVP flow
+
+The current MVP is: WhatsApp OTP -> assessment consent -> saved questionnaire -> face rPPG / optional finger PPG scan -> Heart Risk + educational Heart Age -> 30/60/90-day plan -> Book Health Check -> saved Bengaluru lead. Existing page layouts and styling are retained; comparison and plan sections are added to the existing report and the lead form to the existing booking sheet.
+
+- `PUT /api/journey/consent` records versioned assessment permission before collection.
+- `GET/PUT /api/journey/profile` restores and saves age, sex and questionnaire inputs against the authenticated user.
+- `POST /api/snapshot` requires a verified session and assessment consent. Raw RGB pulse samples (at most 900), measurement metadata and calculated vitals are stored against that user; camera video is not uploaded. Snapshot reads are restricted to the session user.
+- `POST /api/journey/assessment` calculates the existing region-selected risk model, persists the dated assessment, creates the plan and compares earlier assessments. Reopening unchanged results reuses the report; explicit reassessment stores a new report. This path works without a Mistral API call.
+- `GET /api/journey/reports` and `GET /api/journey/reports/{id}` expose only the authenticated user's reports.
+- `GET/PUT /api/journey/reports/{id}/progress` saves daily task completion in India time.
+- `POST /api/journey/leads` stores the verified user, selected lab, Bengaluru area, preferred date/time and explicit contact permission. Request IDs prevent duplicate submissions. This is a lead, not a confirmed appointment.
+- `GET /api/admin/heart-leads` makes leads available to the authorized team; `PATCH /api/admin/heart-leads/{id}` enforces `NEW -> CONTACTED -> BOOKED -> COMPLETED`. Production access uses the existing `ADMIN_KEY` guard. No external partner notification channel is configured.
+
+WhatsApp is **OTP only**, as requested. Automatic health-update delivery is disabled. No day-30/60/90 WhatsApp scheduler or follow-up template is configured; repeat assessment and comparison are available in the app.
+
+Heart Age uses a risk-equivalent reference-age comparison of the repository's existing **educational QRISK3 approximation**, retaining sex, ethnicity and nonmodifiable history. It is not a validated biological-age measurement or the NHS/JBS3 calculator. Age is bounded to 25-84; out-of-range equivalents are labelled. The existing WHO/ISH and SCORE2 calculations retain their limitations. **ASCVD is not implemented.** The 3D hearts illustrate a comparison; plaque, fat and stiffness are not inferred from camera scans. Step counts and a guaranteed heart-age reduction from the example images are not treated as personal clinical targets. Movement guidance references [WHO physical activity guidance](https://www.who.int/europe/news-room/fact-sheets/item/physical-activity).
+
+Validation: `python -m unittest test_heart_journey test_whatsapp test_health_fallback -q`; frontend `npm run lint` and `npm run build`. A local synthetic-data browser smoke test covers mobile/desktop report layout, task completion and lead submission without real database writes or WhatsApp sends. These local changes require backend and frontend deployment before they appear on Cloud Run.

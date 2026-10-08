@@ -139,6 +139,7 @@ class EngageloClient:
     async def send_scan_complete(self, phone: str) -> Dict[str, Any]:
         return await self.send_message(phone, "Your DilSay heart check is complete. Open DilSay to view your results.", message_type="scan_complete")
 
+
     async def send_report_ready(self, phone: str, report_url: Optional[str] = None) -> Dict[str, Any]:
         suffix = f" {report_url}" if report_url else " Open DilSay to view it."
         return await self.send_message(phone, "Your DilSay heart report is ready." + suffix, message_type="report_ready")

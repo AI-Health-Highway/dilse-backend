@@ -44,6 +44,7 @@ class _RateLimitedClient:
 class HealthFallbackTests(unittest.TestCase):
     def test_rate_limit_returns_local_report(self):
         with (
+            patch.object(server, "_session_patient", new=AsyncMock(return_value={"id": "fallback-user", "assessment_consent": True})),
             patch.object(server, "fs_get", new=AsyncMock(return_value=None)),
             patch.object(server, "fs_put", new=AsyncMock()),
             patch.object(server.httpx, "AsyncClient", return_value=_RateLimitedClient()),

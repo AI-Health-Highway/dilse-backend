@@ -193,6 +193,7 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         otp = self.sent[-1][2]
         response = Response()
         result = await server.verify_whatsapp_otp(request({"phone": phone, "otp": otp}), response)
+        self.db[server.COL_PATIENTS][result["row"]["id"]]["assessment_consent"] = True
         token = response.headers["set-cookie"].split("dilsay_session=", 1)[1].split(";", 1)[0]
         return result["row"], token
 
@@ -270,7 +271,7 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(revoked["consent"])
         self.assertEqual(len(self.db[server.COL_WHATSAPP_CONSENTS]), 2)
 
-    async def test_face_finger_and_test_ready_delivery(self):
+    async def test_face_finger_and_test_ready_are_otp_only(self):
         _patient, token = await self.authenticate()
         await server.update_whatsapp_consent(request({"consent": True, "source": "scan_rppg"}, cookie=token, method="PUT"))
         for mode in ("face", "finger"):
@@ -282,8 +283,8 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         tasks = BackgroundTasks()
         await server.save_test_status(request({"testType": "ai_steth", "status": "ready"}, cookie=token), tasks)
         await tasks()
-        self.assertEqual([row[0] for row in self.sent].count("scan_complete"), 2)
-        self.assertIn("test_update", [row[0] for row in self.sent])
+        self.assertEqual([row[0] for row in self.sent].count("scan_complete"), 0)
+        self.assertNotIn("test_update", [row[0] for row in self.sent])
 
     async def test_provider_failure_does_not_fail_completed_scan(self):
         _patient, token = await self.authenticate()
@@ -301,9 +302,7 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
             result = await server.save_snapshot(request({"mode": "face", "fused": {"bpm": 70}}, cookie=token), tasks)
             await tasks()
         self.assertTrue(result["ok"])
-        delivery = next(iter(self.db[server.COL_WHATSAPP_DELIVERIES].values()))
-        self.assertEqual(delivery["status"], "failed")
-        self.assertEqual(delivery["error_code"], "provider_unavailable")
+        self.assertFalse(self.db[server.COL_WHATSAPP_DELIVERIES])
 
     async def test_report_notification_respects_consent(self):
         patient, token = await self.authenticate()
@@ -334,7 +333,7 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         await server.update_whatsapp_consent(request({"consent": True, "source": "profile"}, cookie=token, method="PUT"))
         with_consent = await generate()
         self.assertTrue(with_consent["reportId"])
-        self.assertIn("report_ready", [row[0] for row in self.sent])
+        self.assertNotIn("report_ready", [row[0] for row in self.sent])
         self.assertEqual(self.db[server.COL_HEALTH_REPORTS][with_consent["reportId"]]["patientId"], patient["id"])
 
     async def test_webhook_signature_and_duplicate_are_safe(self):

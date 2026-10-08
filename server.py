@@ -17,6 +17,7 @@ import logging
 import os
 import secrets
 import socket
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,7 @@ from risk import qrisk3, score2, who_ish, route_and_run, list_models
 from echo_centers import find_centers, list_cities, BRAND_META, list_partners
 import wearables
 from services.engagelo import EngageloClient, EngageloConfigurationError, EngageloDeliveryError, EngageloSettings, mask_phone
+from services.heart_journey import validate_raw_measurements
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -292,45 +294,8 @@ async def _create_or_get_patient(phone: str, body: Optional[Dict[str, Any]] = No
 
 
 async def _deliver_whatsapp_event(patient_id: str, message_type: str, subject_id: Optional[str] = None, report_url: Optional[str] = None) -> None:
-    """Best-effort background delivery. Never raises into a scan/report request."""
-    patient = await fs_get(COL_PATIENTS, patient_id)
-    if not patient or not patient.get("whatsapp_health_updates_consent"):
-        return
-    delivery = {
-        "id": str(uuid.uuid4()),
-        "patient_id": patient_id,
-        "message_type": message_type,
-        "subject_id": subject_id,
-        "status": "queued",
-        "provider_message_id": None,
-        "error_code": None,
-        "error_message": None,
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-    }
-    await fs_put(COL_WHATSAPP_DELIVERIES, delivery)
-    try:
-        client = EngageloClient(WHATSAPP_SETTINGS)
-        if message_type == "scan_complete":
-            result = await client.send_scan_complete(patient["phone"])
-        elif message_type == "report_ready":
-            result = await client.send_report_ready(patient["phone"], report_url)
-        elif message_type == "test_update":
-            result = await client.send_test_update(patient["phone"])
-        else:
-            raise EngageloDeliveryError("Unsupported message type", safe_code="unsupported_message_type")
-        delivery.update({
-            "status": "sent" if result.get("sent") else "failed",
-            "provider_message_id": result.get("provider_message_id"),
-            "error_code": "integration_disabled" if result.get("disabled") else None,
-            "updated_at": now_iso(),
-        })
-    except EngageloDeliveryError as exc:
-        delivery.update({"status": "failed", "error_code": exc.safe_code, "error_message": str(exc)[:160], "updated_at": now_iso()})
-    except Exception:
-        logger.exception("whatsapp_delivery_unexpected type=%s patient=%s", message_type, patient_id[:8])
-        delivery.update({"status": "failed", "error_code": "internal_error", "error_message": "Unexpected delivery error", "updated_at": now_iso()})
-    await fs_put(COL_WHATSAPP_DELIVERIES, delivery)
+    """Health notifications are disabled: this release sends WhatsApp OTP only."""
+    return
 
 
 def _clean(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -416,11 +381,15 @@ async def firestore_health() -> Dict[str, bool]:
 
 @api.post("/save-assessment")
 async def save_assessment(request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
+    if not patient.get("assessment_consent"):
+        raise HTTPException(status_code=403, detail="Assessment consent is required")
     body = await request.json()
     record = {"id": str(uuid.uuid4()), "created_at": now_iso(), **body}
     # Surface patientId at top-level too for indexing convenience.
     if record.get("profile") and record["profile"].get("patientId"):
         record["patientId"] = record["profile"]["patientId"]
+    record["patientId"] = patient["id"]
     await fs_put(COL_ASSESSMENTS, record)
     p = record.get("profile") or {}
     v = record.get("vitals") or {}
@@ -434,11 +403,13 @@ async def save_assessment(request: Request) -> Dict[str, Any]:
 
 @api.get("/assessments")
 async def list_assessments(
+    request: Request,
     limit: int = Query(100, le=1000),
     offset: int = 0,
     patientId: Optional[str] = None,
 ) -> Dict[str, Any]:
-    where = {"patientId": patientId} if patientId else None
+    patient = await _session_patient(request, required=True)
+    where = {"patientId": patient["id"]}
     rows = await fs_list(
         COL_ASSESSMENTS, where=where,
         limit=min(limit, 1000), offset=max(offset, 0),
@@ -448,15 +419,19 @@ async def list_assessments(
 
 
 @api.get("/assessments/patient/{patient_id}")
-async def list_assessments_patient(patient_id: str) -> Dict[str, Any]:
+async def list_assessments_patient(patient_id: str, request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
+    if patient_id != patient["id"]:
+        raise HTTPException(status_code=404, detail="Not found")
     rows = await fs_list(COL_ASSESSMENTS, where={"patientId": patient_id})
     return {"ok": True, "total": len(rows), "rows": rows}
 
 
 @api.get("/assessments/{aid}")
-async def get_assessment(aid: str) -> Dict[str, Any]:
+async def get_assessment(aid: str, request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
     doc = await fs_get(COL_ASSESSMENTS, aid)
-    if not doc:
+    if not doc or doc.get("patientId") != patient["id"]:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True, "row": doc}
 
@@ -468,8 +443,14 @@ async def save_snapshot(request: Request, background_tasks: BackgroundTasks = No
     body = await request.json()
     if not body.get("fused"):
         raise HTTPException(status_code=400, detail="Missing fused result")
-    session_patient = await _session_patient(request)
-    patient_id = session_patient.get("id") if session_patient else body.get("patientId")
+    try:
+        validate_raw_measurements(body.get("rawMeasurements"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    session_patient = await _session_patient(request, required=True)
+    if not session_patient.get("assessment_consent"):
+        raise HTTPException(status_code=403, detail="Consent is required before saving a scan")
+    patient_id = session_patient["id"]
     record = {
         "id": str(uuid.uuid4()),
         "created_at": now_iso(),
@@ -479,6 +460,9 @@ async def save_snapshot(request: Request, background_tasks: BackgroundTasks = No
         "fused": body.get("fused"),
         "face": body.get("face"),
         "finger": body.get("finger"),
+        "rawMeasurements": body.get("rawMeasurements"),
+        "deviceType": body.get("deviceType"),
+        "durationSec": body.get("durationSec"),
     }
     await fs_put(COL_SNAPSHOTS, record)
     fused = record["fused"] or {}
@@ -494,11 +478,13 @@ async def save_snapshot(request: Request, background_tasks: BackgroundTasks = No
 
 @api.get("/snapshots")
 async def list_snapshots(
+    request: Request,
     limit: int = Query(50, le=500),
     offset: int = 0,
     patientId: Optional[str] = None,
 ) -> Dict[str, Any]:
-    where = {"patientId": patientId} if patientId else None
+    patient = await _session_patient(request, required=True)
+    where = {"patientId": patient["id"]}
     docs = await fs_list(
         COL_SNAPSHOTS, where=where,
         limit=min(limit, 500), offset=max(offset, 0),
@@ -509,9 +495,10 @@ async def list_snapshots(
 
 
 @api.get("/snapshots/{sid}")
-async def get_snapshot(sid: str) -> Dict[str, Any]:
+async def get_snapshot(sid: str, request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
     doc = await fs_get(COL_SNAPSHOTS, sid)
-    if not doc:
+    if not doc or doc.get("patientId") != patient["id"]:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True, "row": doc}
 
@@ -855,12 +842,17 @@ async def export_patient(pid: str, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Not found")
     snaps = await fs_list(COL_SNAPSHOTS, where={"patientId": pid}, limit=10_000)
     assess = await fs_list(COL_ASSESSMENTS, where={"patientId": pid}, limit=10_000)
+    journey_data = {
+        col: await fs_list(col, where={"patient_id": pid}, order_by=None)
+        for col in ("assessment_consents", "heart_check_leads", "heart_plan_progress")
+    }
     return {
         "ok": True,
         "exported_at": now_iso(),
         "patient": p,
         "snapshots": snaps,
         "assessments": assess,
+        "heart_journey": journey_data,
         "notice": "This export contains all personal data AiSteth holds for this pseudonymous patient code.",
     }
 
@@ -879,6 +871,8 @@ async def forget_patient(pid: str, request: Request) -> Dict[str, Any]:
     n_deliveries = await fs_delete_where(COL_WHATSAPP_DELIVERIES, "patient_id", pid)
     n_sessions = await fs_delete_where(COL_AUTH_SESSIONS, "patient_id", pid)
     n_tests = await fs_delete_where(COL_TEST_UPDATES, "patient_id", pid)
+    for col in ("assessment_consents", "heart_check_leads", "heart_plan_progress"):
+        await fs_delete_where(col, "patient_id", pid)
     await get_db().collection(COL_PATIENTS).document(pid).delete()
     logger.info("patient erased pid=%s snaps=%s asses=%s", pid[:8], n_snaps, n_assess)
     return {
@@ -1194,8 +1188,10 @@ async def health_analyze(request: Request, background_tasks: BackgroundTasks = N
     inputs = body.get("inputs") or {}
     vitals = body.get("vitals") or {}
     snapshot_id = body.get("snapshotId")
-    session_patient = await _session_patient(request)
-    patient_id = session_patient.get("id") if session_patient else body.get("patientId")
+    session_patient = await _session_patient(request, required=True)
+    if not session_patient.get("assessment_consent"):
+        raise HTTPException(status_code=403, detail="Assessment consent is required")
+    patient_id = session_patient["id"]
 
     # 1) Compute risk first (deterministic).
     risk_result = route_and_run(inputs)
@@ -1315,15 +1311,19 @@ async def health_analyze(request: Request, background_tasks: BackgroundTasks = N
 
 
 @api.get("/health/reports")
-async def list_health_reports(limit: int = Query(20, le=200)) -> Dict[str, Any]:
-    rows = await fs_list(COL_HEALTH_REPORTS, limit=min(limit, 200))
+async def list_health_reports(request: Request, limit: int = Query(20, le=200)) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
+    rows = await fs_list(COL_HEALTH_REPORTS, where={"patientId": patient["id"]}, order_by=None)
+    rows.sort(key=lambda row: row.get("created_at", ""), reverse=True)
+    rows = rows[:min(limit, 200)]
     return {"ok": True, "total": len(rows), "rows": rows}
 
 
 @api.get("/health/reports/{rid}")
-async def get_health_report(rid: str) -> Dict[str, Any]:
+async def get_health_report(rid: str, request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
     doc = await fs_get(COL_HEALTH_REPORTS, rid)
-    if not doc:
+    if not doc or doc.get("patientId") != patient["id"]:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True, "row": doc}
 
@@ -1750,6 +1750,8 @@ async def wearable_status(device_id: str = Query(...)) -> Dict[str, Any]:
 
 
 # ── App wiring ────────────────────────────────────────────
+from services.journey_routes import register_journey_routes
+register_journey_routes(api, sys.modules[__name__])
 app.include_router(api)
 
 # ── Static frontend (React build baked into the container) ─
