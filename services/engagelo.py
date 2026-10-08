@@ -16,6 +16,8 @@ import httpx
 
 
 logger = logging.getLogger("dilsay.engagelo")
+# Template query parameters contain credentials and OTPs; suppress URL logging.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class EngageloConfigurationError(RuntimeError):
@@ -94,9 +96,14 @@ class EngageloClient:
         for attempt in range(self.settings.max_retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=self.settings.timeout_seconds, transport=self.transport, trust_env=False) as client:
-                    response = await client.post(endpoint, data=payload)
+                    if message_type == "otp":
+                        response = await client.post(endpoint, params=payload)
+                    else:
+                        response = await client.post(endpoint, data=payload)
                 if response.status_code == 429 or response.status_code >= 500:
                     raise EngageloDeliveryError("Transient provider failure", status_code=response.status_code, safe_code="transient_provider_error")
+                if response.status_code in {401, 403}:
+                    raise EngageloDeliveryError("Provider authentication failed", status_code=response.status_code, safe_code="provider_authentication_failed")
                 if response.status_code >= 400:
                     raise EngageloDeliveryError("Provider rejected the message", status_code=response.status_code, safe_code="provider_rejected")
                 try:

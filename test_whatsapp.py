@@ -64,10 +64,12 @@ class AdminAccessTests(unittest.TestCase):
 
 
 class EngageloClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_otp_uses_exact_template_form_contract(self):
+    async def test_otp_uses_exact_template_query_contract(self):
         async def handler(req):
-            self.assertEqual(str(req.url), "https://provider.test/api/v1/whatsapp/send/template")
-            self.assertEqual(parse_qs((await req.aread()).decode()), {
+            self.assertEqual(req.method, "POST")
+            self.assertEqual(str(req.url).split("?", 1)[0], "https://provider.test/api/v1/whatsapp/send/template")
+            self.assertEqual(await req.aread(), b"")
+            self.assertEqual(parse_qs(req.url.query.decode()), {
                 "apiToken": ["secret-api-key"], "phone_number_id": ["sender-id"],
                 "phone_number": ["919876543210"], "template_id": ["454203"],
                 "templateVariable-OTP-1": ["123456"],
@@ -75,6 +77,16 @@ class EngageloClientTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"status": "1"})
         result = await EngageloClient(settings(), httpx.MockTransport(handler)).send_otp("+919876543210", "123456", 5)
         self.assertTrue(result["sent"])
+
+    async def test_unauthorized_is_identified_without_retrying(self):
+        calls = []
+        async def handler(req):
+            calls.append(req)
+            return httpx.Response(401, json={"status": "0"})
+        with self.assertRaises(EngageloDeliveryError) as raised:
+            await EngageloClient(settings(retries=2), httpx.MockTransport(handler)).send_otp("+919876543210", "123456", 5)
+        self.assertEqual(raised.exception.safe_code, "provider_authentication_failed")
+        self.assertEqual(len(calls), 1)
 
     def test_text_sender_needs_only_api_key_and_phone_number_id(self):
         env = {
@@ -204,6 +216,17 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row[2] for row in self.sent], ["123456", "654321"])
         with self.assertRaises(HTTPException):
             await server.verify_whatsapp_otp(request({"phone": "9876543210", "otp": "123456"}), Response())
+
+    async def test_failed_delivery_invalidates_code_and_returns_safe_reason(self):
+        from unittest.mock import AsyncMock
+        provider = AsyncMock()
+        provider.send_otp.side_effect = EngageloDeliveryError("Rejected", safe_code="provider_rejected")
+        with patch.object(server, "EngageloClient", return_value=provider):
+            with self.assertRaises(HTTPException) as raised:
+                await server.request_whatsapp_otp(request({"phone": "9876543210"}))
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.detail["provider_code"], "provider_rejected")
+        self.assertIsNone(next(iter(self.db[server.COL_OTP_CHALLENGES].values()))["otp_hash"])
 
     async def test_phone_normalization_and_otp_success_replay_and_cooldown(self):
         self.assertEqual(server._normalize_phone("98765 43210"), "+919876543210")

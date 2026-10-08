@@ -623,9 +623,14 @@ async def request_whatsapp_otp(request: Request) -> Dict[str, Any]:
         try:
             await EngageloClient(WHATSAPP_SETTINGS).send_otp(phone, otp, max(1, OTP_TTL_SECONDS // 60))
         except EngageloDeliveryError as exc:
-            challenge.update({"delivery_error": exc.safe_code, "updated_at": now_iso()})
+            challenge.update({"delivery_error": exc.safe_code, "otp_hash": None, "updated_at": now_iso()})
             await fs_put(COL_OTP_CHALLENGES, challenge)
-            detail = "Unable to send OTP. Please try again."
+            detail = {
+                "code": "OTP_DELIVERY_FAILED",
+                "provider_code": exc.safe_code,
+                "message": "Unable to send OTP. Please try again after the resend timer.",
+                "retry_after": OTP_RESEND_COOLDOWN_SECONDS,
+            }
             raise HTTPException(status_code=503, detail=detail)
     logger.info("otp_requested phone=%s", mask_phone(phone))
     return {"success": True, "message": "OTP ready" if development_otp else "OTP sent", "expiresIn": OTP_TTL_SECONDS, "resendAfter": OTP_RESEND_COOLDOWN_SECONDS}
