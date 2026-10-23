@@ -49,6 +49,18 @@ def register_journey_routes(api, backend):
         await s.fs_put(s.COL_PATIENTS, row)
         return {"ok": True, "profile": inputs}
 
+    @api.put("/journey/skin-tone")
+    async def save_skin_tone(request: Request):
+        row = await patient(request)
+        body = await request.json()
+        tone = body.get("skin_tone")
+        if tone is not None and (type(tone) is not int or not 1 <= tone <= 6):
+            raise HTTPException(400, "Select a skin tone from 1 to 6")
+        profile = {**(row.get("health_profile") or {}), "skin_tone": tone}
+        row.update(health_profile=profile, updated_at=s.now_iso())
+        await s.fs_put(s.COL_PATIENTS, row)
+        return {"ok": True, "profile": profile}
+
     @api.post("/journey/assessment")
     async def assessment(request: Request):
         row = await patient(request)

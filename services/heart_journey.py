@@ -14,6 +14,8 @@ from risk.qrisk3 import qrisk3
 
 def validate_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
     result = dict(inputs)
+    if result.get("skin_tone") not in (None, "") and (type(result["skin_tone"]) is not int or not 1 <= result["skin_tone"] <= 6):
+        raise ValueError("Select a skin tone from 1 to 6")
     for key, low, high in (("age", 25, 84), ("sbp", 70, 250)):
         try:
             value = float(result.get(key))

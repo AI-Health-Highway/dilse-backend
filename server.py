@@ -64,7 +64,7 @@ OTP_TTL_SECONDS = max(60, int(os.environ.get("OTP_TTL_SECONDS", "300")))
 OTP_MAX_ATTEMPTS = max(1, int(os.environ.get("OTP_MAX_ATTEMPTS", "5")))
 OTP_RESEND_COOLDOWN_SECONDS = max(1, int(os.environ.get("OTP_RESEND_COOLDOWN_SECONDS", "30")))
 OTP_HASH_SECRET = os.environ.get("OTP_HASH_SECRET", "") or ("dilsay-local-development-only" if WHATSAPP_DEV_OTP else "")
-AUTH_SESSION_TTL_SECONDS = max(3600, int(os.environ.get("AUTH_SESSION_TTL_SECONDS", str(30 * 86400))))
+AUTH_SESSION_TTL_SECONDS = 2 * 60 * 60
 AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "true").strip().lower() in {"1", "true", "yes", "on"}
 ENGAGELO_WEBHOOK_SECRET = os.environ.get("ENGAGELO_WEBHOOK_SECRET", "")
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "").rstrip("/")
@@ -245,7 +245,7 @@ async def _session_patient(request: Request, *, required: bool = False) -> Optio
             raise HTTPException(status_code=401, detail="Authentication required")
         return None
     session = await fs_get(COL_AUTH_SESSIONS, _token_hash(token))
-    if not session or session.get("revoked_at") or float(session.get("expires_at_epoch") or 0) <= time.time():
+    if not session or session.get("revoked_at") or _session_expiry(session) <= time.time():
         if required:
             raise HTTPException(status_code=401, detail="Session expired")
         return None
@@ -255,6 +255,16 @@ async def _session_patient(request: Request, *, required: bool = False) -> Optio
             raise HTTPException(status_code=401, detail="Session is no longer valid")
         return None
     return patient
+
+
+def _session_expiry(session: Dict[str, Any]) -> float:
+    """Cap previously issued sessions too; activity never extends a session."""
+    expiry = float(session.get("expires_at_epoch") or 0)
+    try:
+        created = datetime.fromisoformat(session["created_at"])
+        return min(expiry, created.timestamp() + AUTH_SESSION_TTL_SECONDS)
+    except (KeyError, TypeError, ValueError):
+        return 0
 
 
 async def _create_or_get_patient(phone: str, body: Optional[Dict[str, Any]] = None, *, verified: bool = False) -> tuple[Dict[str, Any], bool]:
@@ -463,6 +473,7 @@ async def save_snapshot(request: Request, background_tasks: BackgroundTasks = No
         "rawMeasurements": body.get("rawMeasurements"),
         "deviceType": body.get("deviceType"),
         "durationSec": body.get("durationSec"),
+        "skinTone": (session_patient.get("health_profile") or {}).get("skin_tone"),
     }
     await fs_put(COL_SNAPSHOTS, record)
     fused = record["fused"] or {}
@@ -474,6 +485,24 @@ async def save_snapshot(request: Request, background_tasks: BackgroundTasks = No
     if session_patient and background_tasks is not None:
         background_tasks.add_task(_deliver_whatsapp_event, session_patient["id"], "scan_complete", record["id"])
     return {"ok": True, "id": record["id"]}
+
+
+@api.put("/snapshots/{snapshot_id}/device-validation")
+async def save_device_validation(snapshot_id: str, request: Request) -> Dict[str, Any]:
+    patient = await _session_patient(request, required=True)
+    record = await fs_get(COL_SNAPSHOTS, snapshot_id)
+    if not record or record.get("patientId") != patient["id"]:
+        raise HTTPException(404, "Scan not found")
+    body = await request.json()
+    bpm = body.get("bpm")
+    if type(bpm) is not int or not 20 <= bpm <= 300:
+        raise HTTPException(400, "Enter a whole number between 20 and 300 BPM")
+    device = body.get("device", "")
+    if not isinstance(device, str) or len(device) > 100:
+        raise HTTPException(400, "Device name must be at most 100 characters")
+    record["deviceValidation"] = {"bpm": bpm, "device": device.strip(), "source": "user_entered", "recordedAt": now_iso()}
+    await fs_put(COL_SNAPSHOTS, record)
+    return {"ok": True, "validation": record["deviceValidation"]}
 
 
 @api.get("/snapshots")
@@ -670,7 +699,8 @@ async def verify_whatsapp_otp(request: Request, response: Response) -> Dict[str,
 @api.get("/auth/session")
 async def auth_session(request: Request) -> Dict[str, Any]:
     patient = await _session_patient(request, required=True)
-    return {"authenticated": True, "row": patient}
+    session = await fs_get(COL_AUTH_SESSIONS, _token_hash(_session_token(request)))
+    return {"authenticated": True, "row": patient, "sessionExpiresAt": _iso_from_epoch(_session_expiry(session))}
 
 
 @api.post("/auth/logout")

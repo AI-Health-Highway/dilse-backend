@@ -11,6 +11,20 @@ from services.journey_routes import LEADS
 INPUTS = {'age': 48, 'sex': 'male', 'region': 'india', 'ethnicity': 'indian', 'sbp': 138, 'bmi': 27.4, 'total_cholesterol': 5.5, 'hdl': 1.2, 'ldl': 3.7, 'commute_hours': 2.5, 'smoking': 'non', 'diabetes_type': 'none'}
 
 class JourneyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_skin_tone_persists_and_can_be_changed(self):
+        response = await self.client.put('/api/journey/profile', json={**INPUTS, 'skin_tone': 5})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['profile']['skin_tone'], 5)
+        response = await self.client.put('/api/journey/skin-tone', json={'skin_tone': 2})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.db[server.COL_PATIENTS]['user-1']['health_profile']['skin_tone'], 2)
+        self.assertEqual(response.json()['profile']['age'], INPUTS['age'])
+        for tone in [True, 0, 7, '3', 2.5]:
+            response = await self.client.put('/api/journey/skin-tone', json={'skin_tone': tone})
+            self.assertEqual(response.status_code, 400)
+            response = await self.client.put('/api/journey/profile', json={**INPUTS, 'skin_tone': tone})
+            self.assertEqual(response.status_code, 400)
+
     async def asyncSetUp(self):
         self.db = defaultdict(dict)
         self.user = {'id': 'user-1', 'phone': '+919876543210', 'phone_verified_at': server.now_iso(), 'assessment_consent': True, 'whatsapp_health_updates_consent': True}

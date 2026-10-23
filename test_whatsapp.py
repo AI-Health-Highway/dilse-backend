@@ -197,6 +197,34 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         token = response.headers["set-cookie"].split("dilsay_session=", 1)[1].split(";", 1)[0]
         return result["row"], token
 
+    async def test_sessions_expire_at_two_hours_including_legacy_sessions(self):
+        _, token = await self.authenticate()
+        session = self.db[server.COL_AUTH_SESSIONS][server._token_hash(token)]
+        created = server.datetime.fromisoformat(session["created_at"]).timestamp()
+        self.assertAlmostEqual(session["expires_at_epoch"] - created, 7200, delta=2)
+        info = await server.auth_session(request(cookie=token))
+        self.assertTrue(info["sessionExpiresAt"])
+        session["expires_at_epoch"] = created + 30 * 86400
+        with patch.object(server.time, "time", return_value=created + 7200):
+            with self.assertRaises(HTTPException) as raised:
+                await server.auth_session(request(cookie=token))
+            self.assertEqual(raised.exception.status_code, 401)
+
+    async def test_device_comparison_is_validated_and_owned(self):
+        patient, token = await self.authenticate()
+        self.db[server.COL_SNAPSHOTS]["scan"] = {"id": "scan", "patientId": patient["id"], "fused": {"bpm": 75}}
+        result = await server.save_device_validation("scan", request({"bpm": 78, "device": "Watch"}, cookie=token))
+        self.assertEqual(result["validation"]["bpm"], 78)
+        self.assertEqual(self.db[server.COL_SNAPSHOTS]["scan"]["fused"]["bpm"], 75)
+        for bpm in [True, 0, 301, 70.5, "80", None]:
+            with self.assertRaises(HTTPException) as raised:
+                await server.save_device_validation("scan", request({"bpm": bpm}, cookie=token))
+            self.assertEqual(raised.exception.status_code, 400)
+        _, other = await self.authenticate("9876543211")
+        with self.assertRaises(HTTPException) as raised:
+            await server.save_device_validation("scan", request({"bpm": 80}, cookie=other))
+        self.assertEqual(raised.exception.status_code, 404)
+
     async def test_fixed_otp_creates_normal_session_without_provider_in_production(self):
         with patch.object(server, "APP_ENV", "production"), patch.object(server, "WHATSAPP_DEV_OTP", "555666"), patch.object(server, "WHATSAPP_SETTINGS", EngageloSettings(False, "https://provider.test", "", "", "91", 1, 0)):
             result = await server.request_whatsapp_otp(request({"phone": "9876543210"}))
