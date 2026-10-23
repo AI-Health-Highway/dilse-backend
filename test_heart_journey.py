@@ -11,6 +11,18 @@ from services.journey_routes import LEADS
 INPUTS = {'age': 48, 'sex': 'male', 'region': 'india', 'ethnicity': 'indian', 'sbp': 138, 'bmi': 27.4, 'total_cholesterol': 5.5, 'hdl': 1.2, 'ldl': 3.7, 'commute_hours': 2.5, 'smoking': 'non', 'diabetes_type': 'none'}
 
 class JourneyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_age_and_gender_are_required(self):
+        inputs = {'age': 48, 'sex': 'female', 'sbp': '', 'bmi': '', 'hdl': '', 'smoking': '', 'diabetes_type': ''}
+        response = await self.client.put('/api/journey/profile', json=inputs)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn('sbp', response.json()['profile'])
+        response = await self.client.post('/api/journey/assessment', json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn('sbp', [factor['key'] for factor in response.json()['journey']['factors']])
+        for inputs in ({'sex': 'male'}, {'age': 48}, {'age': 48, 'sex': ''}):
+            response = await self.client.put('/api/journey/profile', json=inputs)
+            self.assertEqual(response.status_code, 400)
+
     async def test_skin_tone_persists_and_can_be_changed(self):
         response = await self.client.put('/api/journey/profile', json={**INPUTS, 'skin_tone': 5})
         self.assertEqual(response.status_code, 200, response.text)

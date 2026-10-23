@@ -13,10 +13,10 @@ from risk.qrisk3 import qrisk3
 
 
 def validate_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
-    result = dict(inputs)
+    result = {key: value for key, value in inputs.items() if value not in (None, "")}
     if result.get("skin_tone") not in (None, "") and (type(result["skin_tone"]) is not int or not 1 <= result["skin_tone"] <= 6):
         raise ValueError("Select a skin tone from 1 to 6")
-    for key, low, high in (("age", 25, 84), ("sbp", 70, 250)):
+    for key, low, high in (("age", 25, 84),):
         try:
             value = float(result.get(key))
         except (TypeError, ValueError):
@@ -30,7 +30,7 @@ def validate_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Select smoking status")
     if result.get("diabetes_type", "none") not in {"none", "type1", "type2"}:
         raise ValueError("Select diabetes status")
-    for key, low, high in (("bmi", 10, 80), ("total_cholesterol", 1, 20), ("hdl", 0.1, 10), ("chol_hdl_ratio", 0.5, 30), ("ldl", 0.1, 20), ("dbp", 40, 160), ("commute_hours", 0, 24)):
+    for key, low, high in (("sbp", 70, 250), ("bmi", 10, 80), ("total_cholesterol", 1, 20), ("hdl", 0.1, 10), ("chol_hdl_ratio", 0.5, 30), ("ldl", 0.1, 20), ("dbp", 40, 160), ("commute_hours", 0, 24)):
         if result.get(key) not in (None, ""):
             value = float(result[key])
             if not math.isfinite(value) or not low <= value <= high:
@@ -53,7 +53,7 @@ def journey_summary(inputs: dict[str, Any], risk: dict[str, Any]) -> dict[str, A
     range_note = "above" if current["score"] > candidates[-1][1] else "below" if current["score"] < candidates[0][1] else None
     factors = []
     for key, label, active, value in (
-        ("sbp", "Blood pressure", float(inputs["sbp"]) > 120, f"{inputs['sbp']:g} mmHg"),
+        ("sbp", "Blood pressure", float(inputs.get("sbp") or 0) > 120, f"{inputs.get('sbp', 0):g} mmHg"),
         ("smoking", "Smoking", inputs.get("smoking", "non") not in {"non", "ex"}, inputs.get("smoking")),
         ("diabetes_type", "Diabetes", inputs.get("diabetes_type", "none") != "none", inputs.get("diabetes_type")),
         ("bmi", "BMI", float(inputs.get("bmi") or 23) > 25, inputs.get("bmi")),
@@ -66,13 +66,13 @@ def journey_summary(inputs: dict[str, Any], risk: dict[str, Any]) -> dict[str, A
     first = ["Build towards 150 minutes of moderate movement per week, at a comfortable pace.",
              "Replace sugary drinks with water and add vegetables to meals.",
              "Keep a regular sleep schedule."]
-    if float(inputs["sbp"]) >= 130 or inputs.get("treated_hypertension"):
+    if float(inputs.get("sbp") or 0) >= 130 or inputs.get("treated_hypertension"):
         first.append("Record cuff blood pressure 3 times a week and review the log with a clinician.")
     if inputs.get("smoking", "non") not in {"non", "ex"}:
         first.append("Arrange support for stopping tobacco use.")
     if inputs.get("diabetes_type", "none") != "none":
         first.append("Review diabetes monitoring and your existing care plan with your clinician.")
-    if risk["primary"]["band"] in {"high", "very_high"} or float(inputs["sbp"]) >= 160:
+    if risk["primary"]["band"] in {"high", "very_high"} or float(inputs.get("sbp") or 0) >= 160:
         first.append("Arrange a clinical consultation to review your risk factors.")
     second = ["Maintain regular walking and add strength activity on 2 days a week if suitable.",
               "Build meals around vegetables, whole grains and pulses; reduce excess salt.",
